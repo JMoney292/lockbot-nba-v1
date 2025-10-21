@@ -5,11 +5,6 @@
 # - Single-game mode: enter matchup features → model outputs ML pick, spread pick, O/U pick + confidence.
 # - Batch mode: upload a CSV of games → model scores every game and marks a 🔒 Lock of the Day.
 # - All weights are adjustable in the sidebar so you can tune and calibrate.
-#
-# How it works (simple, transparent math):
-# - WinScore = weighted sum of interpretable features (ELO diff, recent form, matchup ratings, rest, B2B, injuries, home edge, travel fatigue, market spread sanity check).
-# - WinProb = sigmoid(WinScore / scale). Recommended ML/Spread pick based on WinProb vs book line.
-# - TotalScore compares pace & efficiency vs market total and recent O/U trends → Over/Under + confidence.
 
 import math
 import numpy as np
@@ -32,29 +27,30 @@ lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Weights — Moneyline/Spread (WinScore)")
 w = {
-    "elo": st.sidebar.slider("ELO Differential", 0.0, 2.0, 1.0, 0.05),
-    "form": st.sidebar.slider("Recent Form (W% last 10)", 0.0, 2.0, 0.6, 0.05),
-    "matchup": st.sidebar.slider("Matchup (ORtg vs opp DRtg)", 0.0, 2.0, 0.8, 0.05),
-    "pace": st.sidebar.slider("Pace Edge", 0.0, 1.5, 0.3, 0.05),
-    "home": st.sidebar.slider("Home Edge", 0.0, 2.0, 0.8, 0.05),
-    "rest": st.sidebar.slider("Rest Edge (days diff)", 0.0, 2.0, 0.6, 0.05),
-    "b2b": st.sidebar.slider("Back-to-Back Penalty", 0.0, 2.0, 0.7, 0.05),
-    "inj_off": st.sidebar.slider("Injuries — Offensive Impact", 0.0, 2.0, 0.7, 0.05),
-    "inj_def": st.sidebar.slider("Injuries — Defensive Impact", 0.0, 2.0, 0.6, 0.05),
+    "elo":    st.sidebar.slider("ELO Differential", 0.0, 2.0, 1.0, 0.05),
+    "form":   st.sidebar.slider("Recent Form (W% last 10)", 0.0, 2.0, 0.6, 0.05),
+    "matchup":st.sidebar.slider("Matchup (ORtg vs opp DRtg)", 0.0, 2.0, 0.8, 0.05),
+    "pace":   st.sidebar.slider("Pace Edge", 0.0, 1.5, 0.3, 0.05),
+    "home":   st.sidebar.slider("Home Edge", 0.0, 2.0, 0.8, 0.05),
+    "rest":   st.sidebar.slider("Rest Edge (days diff)", 0.0, 2.0, 0.6, 0.05),
+    "b2b":    st.sidebar.slider("Back-to-Back Penalty", 0.0, 2.0, 0.7, 0.05),
+    "inj_off":st.sidebar.slider("Injuries — Offensive Impact", 0.0, 2.0, 0.7, 0.05),
+    "inj_def":st.sidebar.slider("Injuries — Defensive Impact", 0.0, 2.0, 0.6, 0.05),
     "travel": st.sidebar.slider("Travel Fatigue (miles diff scaled)", 0.0, 2.0, 0.4, 0.05),
-    "h2h": st.sidebar.slider("Head-to-Head (recent)", 0.0, 1.5, 0.3, 0.05),
+    "h2h":    st.sidebar.slider("Head-to-Head (recent)", 0.0, 1.5, 0.3, 0.05),
     "market": st.sidebar.slider("Market Spread Sanity (sign check)", 0.0, 1.5, 0.5, 0.05),
 }
 
 st.sidebar.subheader("Weights — Totals (TotalScore)")
 wt = {
-    "pace": st.sidebar.slider("Pace vs League Avg", 0.0, 2.0, 0.9, 0.05, key="wt_pace"),
-    "eff": st.sidebar.slider("Off vs Def Efficiency", 0.0, 2.0, 1.1, 0.05, key="wt_eff"),
+    "pace":   st.sidebar.slider("Pace vs League Avg", 0.0, 2.0, 0.9, 0.05, key="wt_pace"),
+    "eff":    st.sidebar.slider("Off vs Def Efficiency", 0.0, 2.0, 1.1, 0.05, key="wt_eff"),
     "recent": st.sidebar.slider("Recent O/U Trend", 0.0, 2.0, 0.6, 0.05, key="wt_recent"),
-    "inj": st.sidebar.slider("Injuries (Off & Def)", 0.0, 2.0, 0.6, 0.05, key="wt_inj"),
+    "inj":    st.sidebar.slider("Injuries (Off & Def)", 0.0, 2.0, 0.6, 0.05, key="wt_inj"),
 }
 
 st.sidebar.markdown("---")
+FOLLOW_ML_MARGIN = st.sidebar.slider("ATS follows ML unless opposite edge ≥ (%)", 0.0, 6.0, 3.0, 0.5) / 100.0
 st.sidebar.caption("Tip: Start with defaults, then tune using recent slates. Keep a notebook of your best-performing presets.")
 
 # -----------------------------
@@ -64,18 +60,19 @@ def sigmoid(x, scale):
     return 1 / (1 + math.exp(-x / max(scale, 1e-6)))
 
 def win_score_features(row):
-    elo_diff = row.get("elo_home", 0) - row.get("elo_away", 0)
+    elo_diff  = row.get("elo_home", 0) - row.get("elo_away", 0)
     form_diff = row.get("last10_home_winpct", 0) - row.get("last10_away_winpct", 0)
-    matchup = (row.get("off_home", 110) - row.get("def_away", 110)) - (row.get("off_away", 110) - row.get("def_home", 110))
+    matchup   = (row.get("off_home", 110) - row.get("def_away", 110)) - (row.get("off_away", 110) - row.get("def_home", 110))
     pace_edge = (row.get("pace_home", league_avg_pace) - row.get("pace_away", league_avg_pace)) / 10.0
     home_edge = 1.0
     rest_edge = (row.get("rest_home", 0) - row.get("rest_away", 0))
-    b2b_pen = (1 if row.get("b2b_home", 0) else 0) - (1 if row.get("b2b_away", 0) else 0)
-    inj_off = (row.get("injuries_off_away", 0) - row.get("injuries_off_home", 0))
-    inj_def = (row.get("injuries_def_away", 0) - row.get("injuries_def_home", 0))
-    travel = (row.get("travel_away", 0) - row.get("travel_home", 0)) / 500.0
-    h2h = row.get("h2h_home", 0) - 0.5
-    market = -row.get("spread_home", 0) / 10.0
+    b2b_pen   = (1 if row.get("b2b_home", 0) else 0) - (1 if row.get("b2b_away", 0) else 0)
+    inj_off   = (row.get("injuries_off_away", 0) - row.get("injuries_off_home", 0))
+    inj_def   = (row.get("injuries_def_away", 0) - row.get("injuries_def_home", 0))
+    travel    = (row.get("travel_away", 0) - row.get("travel_home", 0)) / 500.0
+    h2h       = row.get("h2h_home", 0) - 0.5
+    market    = -row.get("spread_home", 0) / 10.0
+
     return {
         "elo": elo_diff, "form": form_diff, "matchup": matchup, "pace": pace_edge, "home": home_edge,
         "rest": rest_edge, "b2b": -b2b_pen, "inj_off": inj_off, "inj_def": inj_def, "travel": travel,
@@ -88,16 +85,37 @@ def compute_win(row):
     winprob_home = sigmoid(winscore, scale_win)
     ml_team = row.get("home") if winprob_home >= 0.5 else row.get("away")
 
-    spread_home = row.get("spread_home", 0.0)  # negative = home favored
-    implied_shift = -spread_home * 0.027  # ~2.7% win prob per point
-    spread_edge = (winprob_home - 0.5) - implied_shift
-    if spread_edge > 0.02:
-        spread_pick = f"{row.get('home')} {spread_home:+g}" if spread_home < 0 else f"{row.get('away')} {-spread_home:+g}"
-    elif spread_edge < -0.02:
-        spread_pick = f"{row.get('away')} {(-spread_home):+g}" if spread_home < 0 else f"{row.get('home')} {spread_home:+g}"
+    # ---------- FIXED ATS LOGIC ----------
+    # Spread is entered from the HOME perspective (negative = home favored; positive = home dog).
+    spread_home = row.get("spread_home", 0.0)
+
+    # Rough mapping: each spread point ≈ 2.7% in win probability
+    implied_shift = -spread_home * 0.027
+    spread_edge = (winprob_home - 0.5) - implied_shift  # >0 = model likes HOME more than market
+
+    def fmt_home(spread):
+        return f"{row.get('home')} {spread:+g}"
+
+    def fmt_away(spread):
+        return f"{row.get('away')} {(-spread):+g}"  # away gets opposite sign
+
+    ml_side = row.get("home") if winprob_home >= 0.5 else row.get("away")
+
+    # Make ATS follow ML unless the opposite edge is big enough
+    if abs(spread_edge) < FOLLOW_ML_MARGIN:
+        spread_pick = fmt_home(spread_home) if ml_side == row.get("home") else fmt_away(spread_home)
     else:
-        fav = row.get('home') if spread_home < 0 else row.get('away')
-        spread_pick = f"{fav} ML"
+        if spread_edge > 0.02:
+            # Model likes HOME more than market → take HOME side of spread (home -X if fav, +X if dog)
+            spread_pick = fmt_home(spread_home)
+        elif spread_edge < -0.02:
+            # Model likes AWAY more than market → take AWAY side of spread
+            spread_pick = fmt_away(spread_home)
+        else:
+            # Very close: default to ML on the market favorite side
+            fav = row.get('home') if spread_home < 0 else row.get('away')
+            spread_pick = f"{fav} ML"
+    # -------------------------------------
 
     conf_pct = round(abs(winprob_home - 0.5) * 200, 1)
     return {
@@ -109,16 +127,16 @@ def compute_win(row):
     }
 
 def compute_total(row):
-    pace_avg = (row.get("pace_home", league_avg_pace) + row.get("pace_away", league_avg_pace)) / 2
-    pace_term = (pace_avg - league_avg_pace) / 2.0
-    eff_term = ((row.get("off_home", 110) + row.get("off_away", 110)) - (row.get("def_home", 110) + row.get("def_away", 110))) / 10.0
-    recent_ou = ((row.get("recent_ou_home", 0) + row.get("recent_ou_away", 0)) / 2.0)
-    inj_term = ((row.get("injuries_off_home", 0) + row.get("injuries_off_away", 0)) - (row.get("injuries_def_home", 0) + row.get("injuries_def_away", 0))) / 2.0
+    pace_avg   = (row.get("pace_home", league_avg_pace) + row.get("pace_away", league_avg_pace)) / 2
+    pace_term  = (pace_avg - league_avg_pace) / 2.0
+    eff_term   = ((row.get("off_home", 110) + row.get("off_away", 110)) - (row.get("def_home", 110) + row.get("def_away", 110))) / 10.0
+    recent_ou  = ((row.get("recent_ou_home", 0) + row.get("recent_ou_away", 0)) / 2.0)
+    inj_term   = ((row.get("injuries_off_home", 0) + row.get("injuries_off_away", 0)) - (row.get("injuries_def_home", 0) + row.get("injuries_def_away", 0))) / 2.0
 
-    total_score = wt["pace"] * pace_term + wt["eff"] * eff_term + wt["recent"] * recent_ou + wt["inj"] * inj_term
+    total_score  = wt["pace"]*pace_term + wt["eff"]*eff_term + wt["recent"]*recent_ou + wt["inj"]*inj_term
     market_total = row.get("total", 220.0)
 
-    projected_delta = total_score * 2.5   # each unit ≈ 2.5 pts inclination
+    projected_delta = total_score * 2.5  # each unit ≈ 2.5 pts inclination vs market
     over_prob = sigmoid(projected_delta, scale_total)
     pick = "Over" if over_prob >= 0.5 else "Under"
     conf_pct = round(abs(over_prob - 0.5) * 200, 1)
