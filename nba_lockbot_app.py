@@ -90,13 +90,30 @@ def predict(si: SimpleInputs) -> Dict:
     home_pts = clamp(pred_total * share + 0.4*exp_margin, 70, 160)
     away_pts = clamp(pred_total - home_pts, 70, 160)
 
-    # Picks — safer logic
-    if home_wp >= 0.64 and exp_margin >= 6:
-        side = f"{si.home_team} -1.5"
-    elif 0.47 <= home_wp <= 0.53:
-        side = f"{si.home_team} +1.5" if home_wp < 0.5 else f"{si.away_team} +1.5"
+    # Picks — market-aware safer logic
+    # Determine which side we favor by win prob
+    favor_home = home_wp >= 0.5
+    # Market view: home favored if spread is negative
+    home_is_market_fav = si.market_spread_home_minus < 0
+
+    if favor_home:
+        if home_wp >= 0.64 and exp_margin >= 6:
+            # If market already favors home, we can lay -1.5; if market has home as a dog, prefer ML (clearer UX)
+            side = f"{si.home_team} -1.5" if home_is_market_fav else f"{si.home_team} ML"
+        elif 0.47 <= home_wp <= 0.53:
+            # Tight: give the market underdog +1.5
+            side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
+        else:
+            side = f"{si.home_team} ML"
     else:
-        side = f"{si.home_team} ML" if home_wp >= 0.5 else f"{si.away_team} ML"
+        # We favor away
+        away_is_market_fav = not home_is_market_fav
+        if (1 - home_wp) >= 0.64 and (-exp_margin) >= 6:
+            side = f"{si.away_team} -1.5" if away_is_market_fav else f"{si.away_team} ML"
+        elif 0.47 <= home_wp <= 0.53:
+            side = f"{si.away_team} +1.5" if home_is_market_fav else f"{si.home_team} +1.5"
+        else:
+            side = f"{si.away_team} ML"
 
     total_edge = pred_total - si.market_total
     if total_edge >= 3.0:
