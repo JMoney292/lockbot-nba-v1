@@ -1,299 +1,352 @@
-# nba_lockbot_app.py
-# Streamlit single-file NBA prediction model (LockBot NBA v1)
-# -----------------------------------------------------------
-# What it does
-# - Single-game mode: enter matchup features → model outputs ML pick, spread pick, O/U pick + confidence.
-# - Batch mode: upload a CSV of games → model scores every game and marks a 🔒 Lock of the Day.
-# - All weights are adjustable in the sidebar so you can tune and calibrate.
-
 import math
+from dataclasses import dataclass, asdict
+from typing import List, Dict
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="LockBot NBA v1", layout="wide")
-st.title("🏀 LockBot NBA v1 — Single-File Streamlit Model")
-st.caption("Transparent, tunable NBA picks: ML / Spread / Total with confidence. Batch mode + Lock of the Day 🔒")
+# -------------------------------------------------------------
+# NBA Prediction Model (Manual-Input) — Like our NFL version
+# -------------------------------------------------------------
+# Notes
+# - No external APIs: you can paste numbers from your research.
+# - Produces: Win % (home & away), predicted score, ML/spread/total pick,
+#   confidence %, and marks a single 🔒 Lock of the Day for a slate.
+# - Safer-pick logic: default to ML; only use -spread for dominant edges,
+#   and +spread for live dogs in tight games.
+# -------------------------------------------------------------
 
-# -----------------------------
-# Sidebar — Global Settings
-# -----------------------------
-st.sidebar.header("Global Settings & Weights")
-league_avg_pace = st.sidebar.number_input("League Avg Pace (poss/48)", 80.0, 110.0, 99.5, 0.1)
-scale_win = st.sidebar.number_input("Sigmoid Scale (Win)", 5.0, 60.0, 25.0, 1.0)
-scale_total = st.sidebar.number_input("Sigmoid Scale (Total)", 2.0, 40.0, 15.0, 1.0)
-lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1)
+st.set_page_config(page_title="NBA Predictor — Like NFL", layout="wide")
+st.title("🏀 NBA Prediction — Like Our NFL Model")
+st.caption("Manual-input model with win %, predicted score, recommended play, and confidence. Add multiple games to build a slate, Top 3, and one 🔒 Lock of the Day.")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Weights — Moneyline/Spread (WinScore)")
-w = {
-    "elo":    st.sidebar.slider("ELO Differential", 0.0, 2.0, 1.0, 0.05),
-    "form":   st.sidebar.slider("Recent Form (W% last 10)", 0.0, 2.0, 0.6, 0.05),
-    "matchup":st.sidebar.slider("Matchup (ORtg vs opp DRtg)", 0.0, 2.0, 0.8, 0.05),
-    "pace":   st.sidebar.slider("Pace Edge", 0.0, 1.5, 0.3, 0.05),
-    "home":   st.sidebar.slider("Home Edge", 0.0, 2.0, 0.8, 0.05),
-    "rest":   st.sidebar.slider("Rest Edge (days diff)", 0.0, 2.0, 0.6, 0.05),
-    "b2b":    st.sidebar.slider("Back-to-Back Penalty", 0.0, 2.0, 0.7, 0.05),
-    "inj_off":st.sidebar.slider("Injuries — Offensive Impact", 0.0, 2.0, 0.7, 0.05),
-    "inj_def":st.sidebar.slider("Injuries — Defensive Impact", 0.0, 2.0, 0.6, 0.05),
-    "travel": st.sidebar.slider("Travel Fatigue (miles diff scaled)", 0.0, 2.0, 0.4, 0.05),
-    "h2h":    st.sidebar.slider("Head-to-Head (recent)", 0.0, 1.5, 0.3, 0.05),
-    "market": st.sidebar.slider("Market Spread Sanity (sign check)", 0.0, 1.5, 0.5, 0.05),
-}
+# ---------------------------
+# Helpers & core math
+# ---------------------------
+@dataclass
+class GameInputs:
+    home_team: str
+    away_team: str
 
-st.sidebar.subheader("Weights — Totals (TotalScore)")
-wt = {
-    "pace":   st.sidebar.slider("Pace vs League Avg", 0.0, 2.0, 0.9, 0.05, key="wt_pace"),
-    "eff":    st.sidebar.slider("Off vs Def Efficiency", 0.0, 2.0, 1.1, 0.05, key="wt_eff"),
-    "recent": st.sidebar.slider("Recent O/U Trend", 0.0, 2.0, 0.6, 0.05, key="wt_recent"),
-    "inj":    st.sidebar.slider("Injuries (Off & Def)", 0.0, 2.0, 0.6, 0.05, key="wt_inj"),
-}
+    # Ratings (per 100 possessions)
+    home_off: float  # ORtg
+    home_def: float  # DRtg
+    away_off: float
+    away_def: float
 
-st.sidebar.markdown("---")
-FOLLOW_ML_MARGIN = st.sidebar.slider("ATS follows ML unless opposite edge ≥ (%)", 0.0, 6.0, 3.0, 0.5) / 100.0
-st.sidebar.caption("Tip: Start with defaults, then tune using recent slates. Keep a notebook of your best-performing presets.")
+    # Recent form (last 5 games)
+    home_l5_margin: float  # avg point diff last 5
+    away_l5_margin: float
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def sigmoid(x, scale):
-    return 1 / (1 + math.exp(-x / max(scale, 1e-6)))
+    # Pace (possessions per 48)
+    home_pace: float
+    away_pace: float
 
-def win_score_features(row):
-    elo_diff  = row.get("elo_home", 0) - row.get("elo_away", 0)
-    form_diff = row.get("last10_home_winpct", 0) - row.get("last10_away_winpct", 0)
-    matchup   = (row.get("off_home", 110) - row.get("def_away", 110)) - (row.get("off_away", 110) - row.get("def_home", 110))
-    pace_edge = (row.get("pace_home", league_avg_pace) - row.get("pace_away", league_avg_pace)) / 10.0
-    home_edge = 1.0
-    rest_edge = (row.get("rest_home", 0) - row.get("rest_away", 0))
-    b2b_pen   = (1 if row.get("b2b_home", 0) else 0) - (1 if row.get("b2b_away", 0) else 0)
-    inj_off   = (row.get("injuries_off_away", 0) - row.get("injuries_off_home", 0))
-    inj_def   = (row.get("injuries_def_away", 0) - row.get("injuries_def_home", 0))
-    travel    = (row.get("travel_away", 0) - row.get("travel_home", 0)) / 500.0
-    h2h       = row.get("h2h_home", 0) - 0.5
-    market    = -row.get("spread_home", 0) / 10.0
+    # ELO or power ratings
+    home_elo: float
+    away_elo: float
 
-    return {
-        "elo": elo_diff, "form": form_diff, "matchup": matchup, "pace": pace_edge, "home": home_edge,
-        "rest": rest_edge, "b2b": -b2b_pen, "inj_off": inj_off, "inj_def": inj_def, "travel": travel,
-        "h2h": h2h, "market": market
+    # Injuries/availability (estimate missing points per 100)
+    home_off_missing: float
+    away_off_missing: float
+    home_def_missing: float
+    away_def_missing: float
+
+    # Rest & schedule
+    home_days_rest: float
+    away_days_rest: float
+    home_b2b: bool
+    away_b2b: bool
+    travel_miles_home: float
+    travel_miles_away: float
+
+    # Market lines (optional, for bet reco)
+    market_spread_home_minus: float  # negative means home favored; ex: -4.5
+    market_total: float
+
+    # Trends (optional, small weights)
+    home_ou_trend_delta: float  # avg delta from closing total last 5 ("+Over")
+    away_ou_trend_delta: float
+
+
+def logistic(x: float) -> float:
+    return 1 / (1 + math.exp(-x))
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def model_predict(inputs: GameInputs) -> Dict:
+    # --- Feature engineering ---
+    home_net = inputs.home_off - inputs.home_def
+    away_net = inputs.away_off - inputs.away_def
+    net_diff = home_net - away_net
+
+    elo_diff = inputs.home_elo - inputs.away_elo
+    form_diff = inputs.home_l5_margin - inputs.away_l5_margin
+
+    # Adjust for injuries (offense reduced by off_missing, defense worsened by def_missing)
+    adj_home_off = inputs.home_off - inputs.home_off_missing
+    adj_home_def = inputs.home_def + inputs.home_def_missing
+    adj_away_off = inputs.away_off - inputs.away_off_missing
+    adj_away_def = inputs.away_def + inputs.away_def_missing
+
+    adj_home_net = adj_home_off - adj_home_def
+    adj_away_net = adj_away_off - adj_away_def
+    adj_net_diff = adj_home_net - adj_away_net
+
+    # Rest & travel edges
+    rest_edge = (inputs.home_days_rest - inputs.away_days_rest)
+    b2b_edge = (0.0
+                + (0.8 if inputs.away_b2b else 0.0)
+                - (0.8 if inputs.home_b2b else 0.0))
+    travel_edge = clamp((inputs.away_travel_miles - inputs.home_travel_miles) / 1000.0, -2, 2)
+
+    # Pace estimate (blend)
+    pace = 0.5 * (inputs.home_pace + inputs.away_pace)
+
+    # --- Scoring function (linear -> logistic) ---
+    # Calibrated weights (tweakable)
+    w = {
+        'base_hca': 1.2,         # baseline home-court edge
+        'elo': 0.008,            # per ELO point
+        'net': 0.07,             # per net rating point
+        'adj_net': 0.06,         # injuries-adjusted net diff
+        'form': 0.06,            # last 5 margin
+        'rest': 0.12,            # per day of rest edge
+        'b2b': 0.45,             # back-to-back edge units
+        'travel': 0.18,          # per 1000 miles rel.
     }
 
-def compute_win(row):
-    comps = win_score_features(row)
-    winscore = sum(w[k] * comps[k] for k in comps)
-    winprob_home = sigmoid(winscore, scale_win)
-    ml_team = row.get("home") if winprob_home >= 0.5 else row.get("away")
+    linear_score = (
+        w['base_hca']
+        + w['elo'] * elo_diff
+        + w['net'] * net_diff
+        + w['adj_net'] * adj_net_diff
+        + w['form'] * form_diff
+        + w['rest'] * rest_edge
+        + w['b2b'] * b2b_edge
+        + w['travel'] * travel_edge
+    )
 
-    # ---------- FIXED ATS LOGIC ----------
-    # Spread is entered from the HOME perspective (negative = home favored; positive = home dog).
-    spread_home = row.get("spread_home", 0.0)
+    home_win_prob = logistic(linear_score)
+    away_win_prob = 1 - home_win_prob
 
-    # Rough mapping: each spread point ≈ 2.7% in win probability
-    implied_shift = -spread_home * 0.027
-    spread_edge = (winprob_home - 0.5) - implied_shift  # >0 = model likes HOME more than market
+    # --- Predict points ---
+    # Offensive and defensive matchup adjustment
+    home_off_vs_opp = adj_home_off - 0.5 * (adj_away_def - 112)
+    away_off_vs_opp = adj_away_off - 0.5 * (adj_home_def - 112)
 
-    def fmt_home(spread):
-        return f"{row.get('home')} {spread:+g}"
+    # Convert to per-game using pace: total = pace * (off1 + off2)/100
+    base_total = pace * (home_off_vs_opp + away_off_vs_opp) / 100.0
 
-    def fmt_away(spread):
-        return f"{row.get('away')} {(-spread):+g}"  # away gets opposite sign
+    # Add OU trend nudges (small)
+    total_nudge = 0.15 * (inputs.home_ou_trend_delta + inputs.away_ou_trend_delta)
+    predicted_total = clamp(base_total + total_nudge, 180, 270)
 
-    ml_side = row.get("home") if winprob_home >= 0.5 else row.get("away")
+    # Expected margin from win prob via inverse logistic slope (empirical scale)
+    expected_margin = (home_win_prob - 0.5) * 20 + 0.35 * (adj_net_diff)
 
-    # Make ATS follow ML unless the opposite edge is big enough
-    if abs(spread_edge) < FOLLOW_ML_MARGIN:
-        spread_pick = fmt_home(spread_home) if ml_side == row.get("home") else fmt_away(spread_home)
-    else:
-        if spread_edge > 0.02:
-            # Model likes HOME more than market → take HOME side of spread (home -X if fav, +X if dog)
-            spread_pick = fmt_home(spread_home)
-        elif spread_edge < -0.02:
-            # Model likes AWAY more than market → take AWAY side of spread
-            spread_pick = fmt_away(spread_home)
+    # Split total into team scores by offensive share
+    share = clamp((home_off_vs_opp) / (home_off_vs_opp + away_off_vs_opp + 1e-6), 0.3, 0.7)
+    home_pts = clamp(predicted_total * share + 0.4 * expected_margin, 70, 160)
+    away_pts = clamp(predicted_total - home_pts, 70, 160)
+
+    # --- Bet Recommendation Logic ---
+    # Safer defaults: ML by default; -spread only if strong edge; +spread for live dogs in tight games.
+    spread_edge = expected_margin - (-inputs.market_spread_home_minus)  # how much we beat the book's line
+
+    if home_win_prob >= 0.63 and expected_margin >= 6:
+        play = f"{inputs.home_team} -1.5"
+    elif 0.48 <= home_win_prob <= 0.55:
+        # tight game — consider dog +1.5
+        if home_win_prob < 0.5:
+            play = f"{inputs.home_team} +1.5"
         else:
-            # Very close: default to ML on the market favorite side
-            fav = row.get('home') if spread_home < 0 else row.get('away')
-            spread_pick = f"{fav} ML"
-    # -------------------------------------
+            play = f"{inputs.away_team} +1.5"
+    else:
+        # ML default on the side with higher win prob
+        play = f"{inputs.home_team} ML" if home_win_prob >= 0.5 else f"{inputs.away_team} ML"
 
-    conf_pct = round(abs(winprob_home - 0.5) * 200, 1)
-    return {
-        "WinScore": winscore,
-        "HomeWinProb": winprob_home,
-        "ML_Pick": f"{ml_team} ML",
-        "Spread_Pick": spread_pick,
-        "Win_Confidence_%": conf_pct,
-    }
+    # Total pick
+    total_edge = predicted_total - inputs.market_total
+    if total_edge >= 3.0:
+        total_pick = f"Over {inputs.market_total:.1f}"
+    elif total_edge <= -3.0:
+        total_pick = f"Under {inputs.market_total:.1f}"
+    else:
+        total_pick = "Pass total"
 
-def compute_total(row):
-    pace_avg   = (row.get("pace_home", league_avg_pace) + row.get("pace_away", league_avg_pace)) / 2
-    pace_term  = (pace_avg - league_avg_pace) / 2.0
-    eff_term   = ((row.get("off_home", 110) + row.get("off_away", 110)) - (row.get("def_home", 110) + row.get("def_away", 110))) / 10.0
-    recent_ou  = ((row.get("recent_ou_home", 0) + row.get("recent_ou_away", 0)) / 2.0)
-    inj_term   = ((row.get("injuries_off_home", 0) + row.get("injuries_off_away", 0)) - (row.get("injuries_def_home", 0) + row.get("injuries_def_away", 0))) / 2.0
-
-    total_score  = wt["pace"]*pace_term + wt["eff"]*eff_term + wt["recent"]*recent_ou + wt["inj"]*inj_term
-    market_total = row.get("total", 220.0)
-
-    projected_delta = total_score * 2.5  # each unit ≈ 2.5 pts inclination vs market
-    over_prob = sigmoid(projected_delta, scale_total)
-    pick = "Over" if over_prob >= 0.5 else "Under"
-    conf_pct = round(abs(over_prob - 0.5) * 200, 1)
+    # Confidence: combine signal strengths (normalized 0-100)
+    components = [
+        min(abs(elo_diff) / 50.0, 1.2),
+        min(abs(adj_net_diff) / 6.0, 1.2),
+        min(abs(form_diff) / 6.0, 1.0),
+        min(abs(rest_edge) / 2.0, 1.0),
+        min(abs(total_edge) / 8.0, 1.0) * 0.6,
+    ]
+    conf = clamp(45 + 35 * np.tanh(sum(components)), 50, 85)
 
     return {
-        "TotalScore": total_score,
-        "ProjectedDeltaPts": projected_delta,
-        "OU_Pick": f"{pick} {market_total}",
-        "OU_Confidence_%": conf_pct,
+        'home_win_prob': round(100 * home_win_prob, 1),
+        'away_win_prob': round(100 * away_win_prob, 1),
+        'pred_home': round(home_pts, 1),
+        'pred_away': round(away_pts, 1),
+        'pred_total': round(predicted_total, 1),
+        'expected_margin': round(expected_margin, 2),
+        'side_play': play,
+        'total_play': total_pick,
+        'confidence_pct': round(conf, 1),
     }
 
-def score_game(row):
-    win = compute_win(row)
-    tot = compute_total(row)
-    lock_score = 0.6 * win["Win_Confidence_%"] + 0.4 * tot["OU_Confidence_%"]
-    return {
-        "home": row.get("home"),
-        "away": row.get("away"),
-        "ML_Pick": win["ML_Pick"],
-        "Spread_Pick": win["Spread_Pick"],
-        "Win_Confidence_%": win["Win_Confidence_%"],
-        "OU_Pick": tot["OU_Pick"],
-        "OU_Confidence_%": tot["OU_Confidence_%"],
-        "LockScore": round(lock_score, 1),
-    }
 
-# -----------------------------
-# UI — Single Game / Batch
-# -----------------------------
-t1, t2 = st.tabs(["Single Game", "Batch (CSV Upload)"])
+# ---------------------------
+# UI: single game form
+# ---------------------------
+def single_game_form(key_prefix: str = "") -> GameInputs | None:
+    with st.form(f"game_form_{key_prefix}"):
+        c1, c2, c3 = st.columns([2,2,1])
+        with c1:
+            home_team = st.text_input("Home Team", value="Lakers")
+            away_team = st.text_input("Away Team", value="Warriors")
+            home_off = st.number_input("Home ORtg", 95.0, 125.0, 118.0, 0.1)
+            home_def = st.number_input("Home DRtg", 95.0, 125.0, 113.0, 0.1)
+            away_off = st.number_input("Away ORtg", 95.0, 125.0, 116.0, 0.1)
+            away_def = st.number_input("Away DRtg", 95.0, 125.0, 114.0, 0.1)
+            home_l5_margin = st.number_input("Home L5 avg margin", -20.0, 20.0, 3.0, 0.1)
+            away_l5_margin = st.number_input("Away L5 avg margin", -20.0, 20.0, 1.0, 0.1)
+        with c2:
+            home_pace = st.number_input("Home Pace (poss/48)", 90.0, 110.0, 99.5, 0.1)
+            away_pace = st.number_input("Away Pace (poss/48)", 90.0, 110.0, 100.5, 0.1)
+            home_elo = st.number_input("Home ELO/Power", 1300.0, 1900.0, 1650.0, 1.0)
+            away_elo = st.number_input("Away ELO/Power", 1300.0, 1900.0, 1635.0, 1.0)
+            home_off_missing = st.number_input("Home Off Missing (per 100)", 0.0, 20.0, 0.0, 0.1)
+            away_off_missing = st.number_input("Away Off Missing (per 100)", 0.0, 20.0, 0.0, 0.1)
+            home_def_missing = st.number_input("Home Def Missing (per 100)", 0.0, 20.0, 0.0, 0.1)
+            away_def_missing = st.number_input("Away Def Missing (per 100)", 0.0, 20.0, 0.0, 0.1)
+        with c3:
+            home_days_rest = st.number_input("Home Days Rest", 0.0, 7.0, 2.0, 0.5)
+            away_days_rest = st.number_input("Away Days Rest", 0.0, 7.0, 1.0, 0.5)
+            home_b2b = st.checkbox("Home on B2B", value=False)
+            away_b2b = st.checkbox("Away on B2B", value=False)
+            travel_miles_home = st.number_input("Home Travel Miles", 0.0, 6000.0, 0.0, 10.0)
+            travel_miles_away = st.number_input("Away Travel Miles", 0.0, 6000.0, 1200.0, 10.0)
 
-with t1:
-    st.subheader("Single Game Inputs")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        home = st.text_input("Home Team", "BOS Celtics")
-        away = st.text_input("Away Team", "NY Knicks")
-        spread_home = st.number_input("Market Spread (Home, negative if favored)", -20.0, 20.0, -4.5, 0.5)
-        total = st.number_input("Market Total (O/U)", 160.0, 280.0, 223.5, 0.5)
-        h2h_home = st.slider("Head-to-Head (home win% last 8)", 0.0, 1.0, 0.5, 0.05)
-        travel_home = st.number_input("Travel Miles (Home)", 0.0, 4000.0, 0.0, 50.0)
-        travel_away = st.number_input("Travel Miles (Away)", 0.0, 4000.0, 800.0, 50.0)
-    with c2:
-        elo_home = st.number_input("Home ELO", 1200.0, 2000.0, 1650.0, 10.0)
-        elo_away = st.number_input("Away ELO", 1200.0, 2000.0, 1600.0, 10.0)
-        off_home = st.number_input("Home ORtg (per 100)", 95.0, 130.0, 116.0, 0.5)
-        def_home = st.number_input("Home DRtg (per 100)", 95.0, 130.0, 111.0, 0.5)
-        off_away = st.number_input("Away ORtg (per 100)", 95.0, 130.0, 113.0, 0.5)
-        def_away = st.number_input("Away DRtg (per 100)", 95.0, 130.0, 112.5, 0.5)
-        pace_home = st.number_input("Home Pace (poss/48)", 80.0, 110.0, 100.2, 0.1)
-        pace_away = st.number_input("Away Pace (poss/48)", 80.0, 110.0, 98.9, 0.1)
-    with c3:
-        last10_home = st.slider("Home Win% (last 10)", 0.0, 1.0, 0.7, 0.05)
-        last10_away = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05)
-        rest_home = st.number_input("Home Rest Days", 0.0, 5.0, 2.0, 0.5)
-        rest_away = st.number_input("Away Rest Days", 0.0, 5.0, 1.0, 0.5)
-        b2b_home = st.checkbox("Home on B2B", False)
-        b2b_away = st.checkbox("Away on B2B", True)
-        injuries_off_home = st.slider("Home Offense Missing (pts/100)", 0.0, 20.0, 2.0, 0.5)
-        injuries_off_away = st.slider("Away Offense Missing (pts/100)", 0.0, 20.0, 4.0, 0.5)
-        injuries_def_home = st.slider("Home Defense Missing (pts/100)", 0.0, 20.0, 1.0, 0.5)
-        injuries_def_away = st.slider("Away Defense Missing (pts/100)", 0.0, 20.0, 2.0, 0.5)
-        recent_ou_home = st.slider("Home Recent O/U Trend (avg delta, +Over)", -10.0, 10.0, 1.0, 0.5)
-        recent_ou_away = st.slider("Away Recent O/U Trend (avg delta, +Over)", -10.0, 10.0, -0.5, 0.5)
+        c4, c5 = st.columns(2)
+        with c4:
+            market_spread_home_minus = st.number_input("Market Spread (home negative, e.g., -4.5)", -20.0, 20.0, -3.5, 0.5)
+            market_total = st.number_input("Market Total", 170.0, 280.0, 232.5, 0.5)
+        with c5:
+            home_ou_trend_delta = st.number_input("Home O/U trend delta (+'Over')", -12.0, 12.0, 0.5, 0.1)
+            away_ou_trend_delta = st.number_input("Away O/U trend delta (+'Over')", -12.0, 12.0, -0.2, 0.1)
 
-    if st.button("Score Game", type="primary"):
-        row = {
-            "home": home, "away": away,
-            "spread_home": spread_home, "total": total,
-            "h2h_home": h2h_home,
-            "travel_home": travel_home, "travel_away": travel_away,
-            "elo_home": elo_home, "elo_away": elo_away,
-            "off_home": off_home, "def_home": def_home,
-            "off_away": off_away, "def_away": def_away,
-            "pace_home": pace_home, "pace_away": pace_away,
-            "last10_home_winpct": last10_home, "last10_away_winpct": last10_away,
-            "rest_home": rest_home, "rest_away": rest_away,
-            "b2b_home": int(b2b_home), "b2b_away": int(b2b_away),
-            "injuries_off_home": injuries_off_home, "injuries_off_away": injuries_off_away,
-            "injuries_def_home": injuries_def_home, "injuries_def_away": injuries_def_away,
-            "recent_ou_home": recent_ou_home, "recent_ou_away": recent_ou_away,
-        }
-        result = score_game(row)
-        with st.container(border=True):
-            st.markdown(f"**Matchup:** {home} vs {away}")
-            cA, cB, cC = st.columns(3)
-            cA.metric("ML Pick", result["ML_Pick"], f"Confidence {result['Win_Confidence_%']}%")
-            cB.metric("Spread Pick", result["Spread_Pick"])
-            cC.metric("Total Pick", result["OU_Pick"], f"Confidence {result['OU_Confidence_%']}%")
-            st.markdown(f"**Lock Score:** {result['LockScore']} (Lock threshold {lock_min_conf}%)")
-            if result["LockScore"] >= lock_min_conf:
-                st.success("🔒 Consider this a Lock of the Day candidate.")
-            else:
-                st.info("Not strong enough for 🔒 by your threshold.")
+        submitted = st.form_submit_button("Predict Game")
 
-with t2:
-    st.subheader("Batch Upload — Score a Full Slate")
-    st.caption("Upload a CSV with columns (lowercase): home, away, spread_home (home negative if favored), total, elo_home, elo_away, off_home, def_home, off_away, def_away, pace_home, pace_away, last10_home_winpct, last10_away_winpct, rest_home, rest_away, b2b_home, b2b_away, injuries_off_home, injuries_off_away, injuries_def_home, injuries_def_away, recent_ou_home, recent_ou_away, h2h_home, travel_home, travel_away")
+    if not submitted:
+        return None
 
-    def example_df():
-        return pd.DataFrame([
+    return GameInputs(
+        home_team=home_team,
+        away_team=away_team,
+        home_off=home_off,
+        home_def=home_def,
+        away_off=away_off,
+        away_def=away_def,
+        home_l5_margin=home_l5_margin,
+        away_l5_margin=away_l5_margin,
+        home_pace=home_pace,
+        away_pace=away_pace,
+        home_elo=home_elo,
+        away_elo=away_elo,
+        home_off_missing=home_off_missing,
+        away_off_missing=away_off_missing,
+        home_def_missing=home_def_missing,
+        away_def_missing=away_def_missing,
+        home_days_rest=home_days_rest,
+        away_days_rest=away_days_rest,
+        home_b2b=home_b2b,
+        away_b2b=away_b2b,
+        travel_miles_home=travel_miles_home,
+        travel_miles_away=travel_miles_away,
+        market_spread_home_minus=market_spread_home_minus,
+        market_total=market_total,
+        home_ou_trend_delta=home_ou_trend_delta,
+        away_ou_trend_delta=away_ou_trend_delta,
+    )
+
+
+# ---------------------------
+# Slate management
+# ---------------------------
+if 'slate' not in st.session_state:
+    st.session_state.slate = []  # list of dicts {inputs: GameInputs, output: dict}
+
+left, right = st.columns([1.2, 1])
+with left:
+    gi = single_game_form("main")
+    if gi:
+        out = model_predict(gi)
+        st.subheader("Result")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(f"{gi.home_team} Win %", f"{out['home_win_prob']}%")
+        c2.metric(f"{gi.away_team} Win %", f"{out['away_win_prob']}%")
+        c3.metric("Predicted Total", out['pred_total'])
+        c4.metric("Confidence", f"{out['confidence_pct']}%")
+
+        st.write(
+            f"**Predicted Score:** {gi.away_team} {out['pred_away']} @ {gi.home_team} {out['pred_home']}  ")
+        st.write(f"**Side:** {out['side_play']}  |  **Total:** {out['total_play']}  |  **Edge (spread est):** {out['expected_margin']} pts")
+
+        add = st.button("➕ Add to Slate")
+        if add:
+            st.session_state.slate.append({
+                'inputs': asdict(gi),
+                'output': out
+            })
+            st.success("Added to slate.")
+
+with right:
+    st.subheader("Tonight's Slate")
+    if st.session_state.slate:
+        df = pd.DataFrame([
             {
-                "home": "BOS Celtics", "away": "NY Knicks", "spread_home": -4.5, "total": 223.5,
-                "elo_home": 1660, "elo_away": 1610,
-                "off_home": 117.0, "def_home": 110.0, "off_away": 113.0, "def_away": 112.0,
-                "pace_home": 100.2, "pace_away": 98.9,
-                "last10_home_winpct": 0.7, "last10_away_winpct": 0.55,
-                "rest_home": 2, "rest_away": 1,
-                "b2b_home": 0, "b2b_away": 1,
-                "injuries_off_home": 2.0, "injuries_off_away": 4.0,
-                "injuries_def_home": 1.0, "injuries_def_away": 2.0,
-                "recent_ou_home": 1.0, "recent_ou_away": -0.5,
-                "h2h_home": 0.5, "travel_home": 0, "travel_away": 800,
-            },
-            {
-                "home": "DEN Nuggets", "away": "DAL Mavericks", "spread_home": -6.5, "total": 228.5,
-                "elo_home": 1710, "elo_away": 1665,
-                "off_home": 118.5, "def_home": 112.0, "off_away": 117.5, "def_away": 114.5,
-                "pace_home": 98.5, "pace_away": 99.3,
-                "last10_home_winpct": 0.8, "last10_away_winpct": 0.6,
-                "rest_home": 2, "rest_away": 2,
-                "b2b_home": 0, "b2b_away": 0,
-                "injuries_off_home": 1.0, "injuries_off_away": 3.0,
-                "injuries_def_home": 0.0, "injuries_def_away": 1.0,
-                "recent_ou_home": -1.0, "recent_ou_away": 0.5,
-                "h2h_home": 0.6, "travel_home": 200, "travel_away": 900,
-            },
+                'Matchup': f"{g['inputs']['away_team']} @ {g['inputs']['home_team']}",
+                'Pick (Side)': g['output']['side_play'],
+                'Total Pick': g['output']['total_play'],
+                'Pred Score': f"{g['output']['pred_away']} - {g['output']['pred_home']}",
+                'Home Win %': g['output']['home_win_prob'],
+                'Conf %': g['output']['confidence_pct'],
+            }
+            for g in st.session_state.slate
         ])
+        st.dataframe(df, use_container_width=True)
 
-    ex = example_df()
-    ex_csv = ex.to_csv(index=False).encode()
-    st.download_button("Download CSV Template (with examples)", data=ex_csv, file_name="nba_lockbot_template.csv", mime="text/csv")
+        # Rank by confidence and compute Top 3 & Lock of the Day (highest conf, avoid volatile totals only)
+        ranked = sorted(st.session_state.slate, key=lambda x: x['output']['confidence_pct'], reverse=True)
+        st.markdown("---")
+        st.markdown("### ⭐ Top 3 Plays")
+        for i, g in enumerate(ranked[:3], 1):
+            st.write(f"**{i}.** {g['inputs']['away_team']} @ {g['inputs']['home_team']} — {g['output']['side_play']} | {g['output']['total_play']} ({g['output']['confidence_pct']}% conf)")
 
-    uploaded = st.file_uploader("Upload your slate CSV", type=["csv"])
-    if uploaded is not None:
-        try:
-            df = pd.read_csv(uploaded)
-            needed = [
-                "home","away","spread_home","total","elo_home","elo_away","off_home","def_home","off_away","def_away","pace_home","pace_away","last10_home_winpct","last10_away_winpct","rest_home","rest_away","b2b_home","b2b_away","injuries_off_home","injuries_off_away","injuries_def_home","injuries_def_away","recent_ou_home","recent_ou_away","h2h_home","travel_home","travel_away"
-            ]
-            missing = [c for c in needed if c not in df.columns]
-            if missing:
-                st.error(f"Missing columns: {missing}")
-            else:
-                results = []
-                for _, row in df.iterrows():
-                    results.append(score_game(row))
-                out = pd.DataFrame(results)
-                out = out.sort_values("LockScore", ascending=False).reset_index(drop=True)
-                if len(out):
-                    if out.loc[0, "LockScore"] >= lock_min_conf:
-                        out.loc[0, "Lock"] = "🔒"
-                    else:
-                        out.loc[0, "Lock"] = "(no 🔒)"
-                st.dataframe(out)
+        lock = ranked[0] if ranked else None
+        if lock:
+            st.markdown("### 🔒 Lock of the Day")
+            g = lock
+            st.success(f"{g['inputs']['away_team']} @ {g['inputs']['home_team']} — {g['output']['side_play']} | {g['output']['total_play']}  ({g['output']['confidence_pct']}% confidence)")
 
-                out_csv = out.to_csv(index=False).encode()
-                st.download_button("Download Picks CSV", data=out_csv, file_name="nba_lockbot_picks.csv", mime="text/csv")
-        except Exception as e:
-            st.exception(e)
+        if st.button("🗑️ Clear Slate"):
+            st.session_state.slate = []
+            st.info("Slate cleared.")
+    else:
+        st.info("Add games from the left panel to build a slate and get Top 3 + 🔒 Lock.")
+
+st.markdown("""
+**Tips for inputs**
+- **ORtg/DRtg**: team points scored/allowed per 100 possessions (cleaningtheglass/Basketball-Reference style). If you only have Net Rating, set ORtg≈112+Net/2, DRtg≈112−Net/2.
+- **L5 margin**: average point differential last 5 games.
+- **Off/Def Missing**: your estimate of how much offense/defense (per 100) is lost due to injuries/minutes restrictions.
+- **OU trend delta**: average of (game total − closing total) over last few games; positive leans Over.
+- **Market Spread**: input as negative when home is favored (e.g., -4.5), positive if home is an underdog.
+""")
