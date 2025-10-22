@@ -7,27 +7,28 @@ import pandas as pd
 import streamlit as st
 
 """
-NBA Prediction — **Simple Version (like our NFL)**
-Inputs kept minimal per game:
+NBA Prediction — **Simplest Version (like our NFL)**
+Now with **no Game Pace input**. We auto-estimate pace from team Net Ratings and last-5 form so you only enter a few fields.
+
+Inputs per game:
 - Teams
 - Home Net Rating, Away Net Rating (Net = ORtg − DRtg)
-- Last-5 Avg Margin (Home, Away)
-- Power/ELO (Home, Away)
-- Pace (single average for the matchup) — default provided
+- Home L5 Avg Margin, Away L5 Avg Margin
+- Home Power/ELO, Away Power/ELO
 - Market Spread (home negative if favored), Market Total
 
 Outputs:
 - Home/Away win %
-- Predicted score & total
+- Predicted score & total (pace auto-estimated)
 - Side pick (ML / ±1.5 with safer logic)
 - Total pick (Over/Under/Pass)
 - Confidence %
-- Build a slate, Top 3, and 🔒 Lock of the Day
+- Slate builder with Top 3 & 🔒 Lock of the Day
 """
 
-st.set_page_config(page_title="NBA Predictor — Simple", layout="wide")
-st.title("🏀 NBA Prediction — Simple (Like Our NFL)")
-st.caption("Minimal inputs. Same workflow: add games, see Top 3, and one 🔒 Lock of the Day.")
+st.set_page_config(page_title="NBA Predictor — Simplest", layout="wide")
+st.title("🏀 NBA Prediction — Simplest (Like Our NFL)")
+st.caption("No pace input required. Minimal fields → predictions, Top 3, and one 🔒 Lock of the Day.")
 
 # ---------------------------
 # Helpers
@@ -51,7 +52,6 @@ class SimpleInputs:
     away_l5: float
     home_elo: float
     away_elo: float
-    pace: float          # possessions per 48 (avg for game)
     market_spread_home_minus: float  # home favored = negative
     market_total: float
 
@@ -61,7 +61,7 @@ def predict(si: SimpleInputs) -> Dict:
     net_diff = si.home_net - si.away_net
     form_diff = si.home_l5 - si.away_l5
 
-    # Linear score to win prob (very compact model)
+    # Linear score → win prob (compact model)
     w_hca = 1.1          # home court
     w_elo = 0.008        # per elo point
     w_net = 0.075        # per net rating point
@@ -71,12 +71,16 @@ def predict(si: SimpleInputs) -> Dict:
     home_wp = logistic(linear)
     away_wp = 1 - home_wp
 
-    # Predicted total using pace and net
-    # Start from league baseline, nudge by net & form
+    # --- Auto-estimated pace (no input) ---
+    # Start at league typical ~99.5 and nudge by style (net) + recent tempo proxy (L5 margins)
+    pace_est = 99.5 + 0.25 * (si.home_net + si.away_net) + 0.12 * (si.home_l5 + si.away_l5)
+    pace_est = clamp(pace_est, 94.0, 104.0)
+
+    # Predicted total using pace_est and net/form
     net_nudge = 0.35 * (si.home_net + si.away_net)
     form_nudge = 0.25 * (si.home_l5 + si.away_l5)
     total_per100 = (LEAGUE_ORtg*2) + net_nudge + form_nudge  # per 100 poss
-    pred_total = clamp(si.pace * total_per100 / 100.0, 180, 270)
+    pred_total = clamp(pace_est * total_per100 / 100.0, 180, 270)
 
     # Expected margin
     exp_margin = (home_wp - 0.5) * 20 + 0.4 * net_diff + 0.25 * form_diff
@@ -86,8 +90,7 @@ def predict(si: SimpleInputs) -> Dict:
     home_pts = clamp(pred_total * share + 0.4*exp_margin, 70, 160)
     away_pts = clamp(pred_total - home_pts, 70, 160)
 
-    # Picks
-    # Side safer logic
+    # Picks — safer logic
     if home_wp >= 0.64 and exp_margin >= 6:
         side = f"{si.home_team} -1.5"
     elif 0.47 <= home_wp <= 0.53:
@@ -95,7 +98,6 @@ def predict(si: SimpleInputs) -> Dict:
     else:
         side = f"{si.home_team} ML" if home_wp >= 0.5 else f"{si.away_team} ML"
 
-    # Total pick
     total_edge = pred_total - si.market_total
     if total_edge >= 3.0:
         total_pick = f"Over {si.market_total:.1f}"
@@ -104,7 +106,6 @@ def predict(si: SimpleInputs) -> Dict:
     else:
         total_pick = "Pass total"
 
-    # Confidence (compact)
     comp = [
         min(abs(elo_diff)/50.0, 1.2),
         min(abs(net_diff)/6.0, 1.2),
@@ -143,7 +144,6 @@ with st.form("simple_game"):
     with c2:
         home_elo = st.number_input("Home Power/ELO", 1300.0, 1900.0, 1650.0, 1.0)
         away_elo = st.number_input("Away Power/ELO", 1300.0, 1900.0, 1635.0, 1.0)
-        pace = st.number_input("Game Pace (poss/48)", 90.0, 110.0, 99.5, 0.1)
         market_spread_home_minus = st.number_input("Market Spread (home negative)", -20.0, 20.0, -3.5, 0.5)
         market_total = st.number_input("Market Total", 170.0, 280.0, 228.5, 0.5)
 
@@ -152,7 +152,7 @@ with st.form("simple_game"):
 if submitted:
     si = SimpleInputs(
         home_team, away_team, home_net, away_net, home_l5, away_l5,
-        home_elo, away_elo, pace, market_spread_home_minus, market_total
+        home_elo, away_elo, market_spread_home_minus, market_total
     )
     out = predict(si)
 
@@ -207,11 +207,11 @@ else:
     st.info("Add a game result above to build the slate and get Top 3 + 🔒 Lock.")
 
 st.markdown("""
-**What to enter**
-- **Net Rating:** ORtg − DRtg. If you only have Net, you're good — no ORtg/DRtg needed.
+**Notes**
+- **No pace input needed.** We estimate pace around 99.5 and nudge it using team Net Ratings and last-5 form, then clamp to a realistic range (94–104).
+- **Net Rating:** ORtg − DRtg. If you only have overall net, use that.
 - **L5 Avg Margin:** Avg point diff over last 5 games.
 - **Power/ELO:** Any power number you use (e.g., 1500–1800 scale). Higher = better.
-- **Pace:** Possessions per 48 for the matchup. If unknown, ~99.5 is fine.
 - **Market Spread:** Negative if home is favored (e.g., -4.5). Positive if home is an underdog.
 - **Market Total:** Sportsbook total for the game.
 """)
