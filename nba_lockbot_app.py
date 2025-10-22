@@ -62,13 +62,22 @@ def predict(si: SimpleInputs) -> Dict:
     form_diff = si.home_l5 - si.away_l5
 
     # Linear score → win prob (compact model)
-    w_hca = 1.1          # home court
+    w_hca = 0.8  # reduced home-court weight so road favorites don't get drowned out          # home court
     w_elo = 0.008        # per elo point
     w_net = 0.075        # per net rating point
     w_form = 0.06        # per margin point
 
     linear = (w_hca + w_elo*elo_diff + w_net*net_diff + w_form*form_diff)
-    home_wp = logistic(linear)
+    home_wp_model = logistic(linear)
+
+    # --- Market-aware prior from spread (home negative => favored)
+    # Map spread points to win prob via logistic slope k
+    k = 0.23  # per point; tweakable
+    market_prior = logistic(-k * si.market_spread_home_minus)
+
+    # Blend model with market prior (lambda = weight on market)
+    lam = 0.30  # 30% market pull to avoid fighting sharp lines in simplified model
+    home_wp = (1 - lam) * home_wp_model + lam * market_prior
     away_wp = 1 - home_wp
 
     # --- Auto-estimated pace (no input) ---
@@ -90,30 +99,34 @@ def predict(si: SimpleInputs) -> Dict:
     home_pts = clamp(pred_total * share + 0.4*exp_margin, 70, 160)
     away_pts = clamp(pred_total - home_pts, 70, 160)
 
-    # Picks — market-aware safer logic with guardrails against fading road favorites
+    # Picks — market-aware logic: use the **market line** when we have a solid edge
     favor_home = home_wp >= 0.5
 
-    # Market view
-    home_is_market_fav = si.market_spread_home_minus < 0  # home negative means favored
-    market_home_fav_by = -si.market_spread_home_minus      # positive => home favored by X; negative => away favored by |X|
+    # Market view (home negative => favored)
+    home_is_market_fav = si.market_spread_home_minus < 0
+    market_home_fav_by = -si.market_spread_home_minus      # +X => home -X,  -Y => away -Y
     home_fav_by = max(0.0, market_home_fav_by)
     away_fav_by = max(0.0, -market_home_fav_by)
 
-    # Default side from model
+    # Default side from model (moneyline safety)
     side = f"{si.home_team} ML" if favor_home else f"{si.away_team} ML"
 
-    # Guardrail 1: Don't fade a ROAD favorite lightly
-    # If away is market favorite by >= 2 and our home win prob < 60%, side with away ML
+    # If we favor the same team the market favors and our expected margin clears the book by a buffer,
+    # bet **the market line** (not auto -1.5).
+    buffer_pts = 1.0  # require we beat the book by at least 1 pt
+
+    if favor_home and home_is_market_fav:
+        if exp_margin >= home_fav_by + buffer_pts:
+            side = f"{si.home_team} -{home_fav_by:.1f}"
+    elif (not favor_home) and (not home_is_market_fav):
+        if (-exp_margin) >= away_fav_by + buffer_pts:
+            side = f"{si.away_team} -{away_fav_by:.1f}"
+
+    # Guardrail: If away is market favorite by >= 2 and our home win% < 60%, don't fade — lean away ML
     if away_fav_by >= 2.0 and home_wp < 0.60:
-        side = f"{si.away_team} ML"
+        side = f"{si.away_team} ML" if not ((-exp_margin) >= away_fav_by + buffer_pts) else f"{si.away_team} -{away_fav_by:.1f}"
 
-    # Guardrail 2: Only lay -1.5 when our expected margin clearly beats the market
-    if favor_home and home_is_market_fav and (exp_margin >= max(6, home_fav_by + 1.5)):
-        side = f"{si.home_team} -1.5"
-    elif (not favor_home) and (not home_is_market_fav) and ((-exp_margin) >= max(6, away_fav_by + 1.5)):
-        side = f"{si.away_team} -1.5"
-
-    # Tight-game safety: if near coin flip (47–53), give market underdog +1.5
+    # Tight-game safety: near coin flip (47–53) — give market underdog +1.5
     if 0.47 <= home_wp <= 0.53:
         side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
 
