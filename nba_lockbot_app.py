@@ -7,41 +7,47 @@ import pandas as pd
 import streamlit as st
 
 """
-NBA Prediction — Accuracy-Tuned v3 (Like Our NFL)
-Minimal inputs, dynamic market anchoring, disciplined spreads/totals,
-optional injury and L5 team-total nudges, and safer road-favorite handling.
+NBA Prediction — Accuracy-Tuned v4 (Conservative Totals)
+- Heavily market-anchored totals with hard ±5 clamp
+- Narrowed pace band (95.5–100.5)
+- Smaller net/form nudges into totals
+- Blowout dampener for big lines
+- Gentler score split and tighter team point caps
+- Keeps all the market-aware side logic from v3
 """
 
-# ==== Tunables / Debug (adjust here) ====
-SHOW_DEBUG = False            # True to show the debug meta expander
-# Win% blend: will be computed dynamically by line size (see code), these are floors/ceils:
+# ==== Tunables / Debug ====
+SHOW_DEBUG = False
+
+# Win% blend (dynamic by line; floors/ceils)
 MARKET_WEIGHT_MIN = 0.55
 MARKET_WEIGHT_MAX = 0.85
-TOTAL_MARKET_WEIGHT = 0.85    # hybrid total = (market*w) + (model*(1-w))
-
-# Spread discipline
-LAY_BUFFER = 3.0              # need to beat book line by this many pts to lay the spread
-MIN_CONF_LAY = 74             # base confidence needed to lay the spread
-DOG_CONFLICT_BUFFER = 2.5     # extra vs book needed to take dog +spread when we disagree
-
-# Road favorite guardrail tiers (don’t fade lightly)
-ROAD_FAV_NOGO1 = 2.0
-ROAD_FAV_NOGO2 = 3.5
-ROAD_FAV_NOGO3 = 6.0          # stronger don’t-fade thresholds
 
 # Totals
-TOTAL_EDGE_FIRE = 6.0         # only fire O/U if |edge| >= this (after hybrid & nudge)
-TT_BETA = 0.20                # weight on last-5 team total nudge (if provided)
-TT_CLAMP = 6.0                # per-team clamp for L5 TT bias (pts)
+TOTAL_CLAMP_ABS = 5.0         # final total cannot deviate from book by more than ±5
+TOTAL_ALPHA_MIN = 0.06        # shrinkage from model toward market on big lines
+TOTAL_ALPHA_MAX = 0.12        # shrinkage on small lines
+TOTAL_EDGE_FIRE = 6.0         # only fire O/U if |edge| >= this
+
+# Last-5 team totals nudge (kept tiny; set TT_BETA=0 to disable)
+TT_BETA = 0.10                # very small weight
+TT_CLAMP = 4.0                # per-team clamp (reduced)
 
 # Pace
-PACE_MIN, PACE_MAX = 96.0, 102.0
-LEAGUE_ORtg = 112.0           # baseline offensive rating per 100
+PACE_MIN, PACE_MAX = 95.5, 100.5
+LEAGUE_ORtg = 112.0
 
-# Streamlit setup
-st.set_page_config(page_title="NBA Predictor — Tuned v3", layout="wide")
-st.title("🏀 NBA Prediction — Accuracy-Tuned v3 (Like Our NFL)")
-st.caption("Dynamic market anchoring, disciplined spreads/totals, optional injury & L5 team-total nudges, safer road-favorite handling.")
+# Spread discipline (from v3)
+LAY_BUFFER = 3.0
+MIN_CONF_LAY = 74
+DOG_CONFLICT_BUFFER = 2.5
+ROAD_FAV_NOGO1 = 2.0
+ROAD_FAV_NOGO2 = 3.5
+ROAD_FAV_NOGO3 = 6.0
+
+st.set_page_config(page_title="NBA Predictor — Tuned v4", layout="wide")
+st.title("🏀 NBA Prediction — Accuracy-Tuned v4 (Conservative Totals)")
+st.caption("Harder anchor to market totals, narrow pace, trimmed nudges, and safer team scoring. Sides keep market-aware rules.")
 
 # ---------------------------
 # Helpers
@@ -56,25 +62,25 @@ def clamp(x: float, lo: float, hi: float) -> float:
 class SimpleInputs:
     home_team: str
     away_team: str
-    home_net: float      # Net Rating (per 100)
+    home_net: float
     away_net: float
-    home_l5: float       # last-5 avg margin
+    home_l5: float
     away_l5: float
     home_elo: float
     away_elo: float
-    market_spread_home_minus: float  # home favored = negative (e.g., -4.5); positive => away favored
+    market_spread_home_minus: float  # home favored = negative
     market_total: float
-    # Optional advanced adjustments (per 100)
+    # Optional adjustments (per 100)
     home_off_missing: float = 0.0
     home_def_missing: float = 0.0
     away_off_missing: float = 0.0
     away_def_missing: float = 0.0
-    # Optional last-5 team totals (raw points scored) — leave 0 or None to skip
+    # Optional last-5 team totals (raw points)
     home_l5_team_total: Optional[float] = None
     away_l5_team_total: Optional[float] = None
 
 def predict(si: SimpleInputs) -> Dict:
-    # Injury-adjusted nets (offense down, defense worse -> subtract)
+    # Injury-adjusted nets
     adj_home_net = (si.home_net - si.home_off_missing) - si.home_def_missing
     adj_away_net = (si.away_net - si.away_off_missing) - si.away_def_missing
 
@@ -82,54 +88,84 @@ def predict(si: SimpleInputs) -> Dict:
     net_diff = adj_home_net - adj_away_net
     form_diff = si.home_l5 - si.away_l5
 
-    # Compact model → home win prob (pre-market)
+    # --- Home win prob (dynamic market anchoring) ---
     w_hca, w_elo, w_net, w_form = 0.5, 0.008, 0.080, 0.055
     linear = (w_hca + w_elo*elo_diff + w_net*net_diff + w_form*form_diff)
     home_wp_model = logistic(linear)
 
-    # Market prior from spread (home negative => favored)
     abs_line = abs(si.market_spread_home_minus)
-    # dynamic k: slightly steeper for big lines
-    k = 0.21 + 0.005 * min(abs_line, 10)        # ~0.21–0.26
+    # dynamic slope k for spread→prob
+    k = 0.21 + 0.005 * min(abs_line, 10)
     market_prior = logistic(-k * si.market_spread_home_minus)
-    # dynamic market weight by line size
+    # dynamic weight on market prior
     lam = clamp(0.55 + 0.03 * min(abs_line, 10), MARKET_WEIGHT_MIN, MARKET_WEIGHT_MAX)
     home_wp = (1 - lam) * home_wp_model + lam * market_prior
     away_wp = 1 - home_wp
 
-    # Auto pace (no input), clamped; tiny style tilt toward slower in mismatches
-    pace_est = 99.5 + 0.15 * (adj_home_net + adj_away_net) + 0.06 * (si.home_l5 + si.away_l5)
+    # --- Pace (narrow and conservative) ---
+    pace_est = 99.2 + 0.12 * (adj_home_net + adj_away_net) + 0.05 * (si.home_l5 + si.away_l5)
     if abs(adj_home_net - adj_away_net) > 6:
-        pace_est -= 0.4
+        pace_est -= 0.4  # mismatches drift slower
     pace_est = clamp(pace_est, PACE_MIN, PACE_MAX)
 
-    # Model total, then hybrid with market
-    net_nudge = 0.35 * (adj_home_net + adj_away_net)
-    form_nudge = 0.25 * (si.home_l5 + si.away_l5)
+    # --- Model total with smaller nudges ---
+    # (reduced coefficients to avoid inflated totals)
+    net_nudge = 0.20 * (adj_home_net + adj_away_net)   # was 0.35
+    form_nudge = 0.15 * (si.home_l5 + si.away_l5)      # was 0.25
     model_total_per100 = (LEAGUE_ORtg * 2) + net_nudge + form_nudge
     model_total = clamp(pace_est * model_total_per100 / 100.0, 180, 270)
-    pred_total = TOTAL_MARKET_WEIGHT * si.market_total + (1 - TOTAL_MARKET_WEIGHT) * model_total
 
-    # Optional last-5 team totals nudge (small, clamped)
-    market_home_tt = si.market_total / 2 - (si.market_spread_home_minus) / 2
-    market_away_tt = si.market_total - market_home_tt
-    bias_home = 0.0
-    bias_away = 0.0
-    if si.home_l5_team_total and si.home_l5_team_total > 0:
-        bias_home = clamp(si.home_l5_team_total - market_home_tt, -TT_CLAMP, TT_CLAMP)
-    if si.away_l5_team_total and si.away_l5_team_total > 0:
-        bias_away = clamp(si.away_l5_team_total - market_away_tt, -TT_CLAMP, TT_CLAMP)
-    pred_total = clamp(pred_total + TT_BETA * (bias_home + bias_away), 180, 270)
+    # --- Strong shrink toward the market total + hard clamp ---
+    # alpha shrinks as line grows (more trust in book on big lines)
+    alpha = TOTAL_ALPHA_MAX - (TOTAL_ALPHA_MAX - TOTAL_ALPHA_MIN) * min(abs_line, 10) / 10.0
+    # market-anchored total
+    pred_total = si.market_total + alpha * (model_total - si.market_total)
+    # blowout dampener (large favorites often depress totals late)
+    pred_total -= 0.20 * max(0.0, abs_line - 7.0)  # up to ~0.6–0.8 pts on huge lines
+    # final clamp to ±TOTAL_CLAMP_ABS from market
+    pred_total = clamp(pred_total, si.market_total - TOTAL_CLAMP_ABS, si.market_total + TOTAL_CLAMP_ABS)
 
-    # Expected margin (home + = home by X)
+    # --- Optional last-5 team totals nudge (very small) ---
+    if TT_BETA > 0:
+        market_home_tt = si.market_total/2 - (si.market_spread_home_minus)/2
+        market_away_tt = si.market_total - market_home_tt
+        bias_home = 0.0
+        bias_away = 0.0
+        if si.home_l5_team_total and si.home_l5_team_total > 0:
+            bias_home = clamp(si.home_l5_team_total - market_home_tt, -TT_CLAMP, TT_CLAMP)
+        if si.away_l5_team_total and si.away_l5_team_total > 0:
+            bias_away = clamp(si.away_l5_team_total - market_away_tt, -TT_CLAMP, TT_CLAMP)
+        pred_total = clamp(pred_total + TT_BETA * (bias_home + bias_away),
+                           si.market_total - TOTAL_CLAMP_ABS,
+                           si.market_total + TOTAL_CLAMP_ABS)
+    else:
+        bias_home = bias_away = 0.0
+
+    # --- Expected margin (home + = home by X) ---
     exp_margin = (home_wp - 0.5) * 20 + 0.42 * net_diff + 0.25 * form_diff
 
-    # Split points (with tiny tilt if TT biases disagree)
-    share = clamp(0.5 + 0.25 * (net_diff / 20.0), 0.35, 0.65)
-    share += 0.0025 * (bias_home - bias_away)  # tiny tilt
-    share = clamp(share, 0.35, 0.65)
-    home_pts = clamp(pred_total * share + 0.4 * exp_margin, 70, 160)
-    away_pts = clamp(pred_total - home_pts, 70, 160)
+    # --- Split total into team scores (gentle, conservative) ---
+    # Use Bradley-Terry style share from margin, softly capped
+    share_center = 0.5
+    share = logistic(exp_margin / 10.0)  # margin→prob curve
+    share = clamp(share, 0.45, 0.55)     # keep splits modest
+    # Tiny tilt if L5 TT disagree
+    share += 0.0015 * (bias_home - bias_away)
+    share = clamp(share, 0.44, 0.56)
+
+    home_pts = pred_total * share
+    away_pts = pred_total - home_pts
+
+    # Safer caps on team points (prevents weird 150+ outputs)
+    home_pts = clamp(home_pts, 80.0, 135.0)
+    away_pts = clamp(away_pts, 80.0, 135.0)
+    # Re-balance to preserve total if clamped
+    total_after_clamp = home_pts + away_pts
+    if total_after_clamp != pred_total:
+        # scale down proportionally to match pred_total
+        scale = pred_total / total_after_clamp
+        home_pts = clamp(home_pts * scale, 80.0, 135.0)
+        away_pts = clamp(away_pts * scale, 80.0, 135.0)
 
     # ---------- Confidence (base) ----------
     total_edge = pred_total - si.market_total
@@ -137,21 +173,21 @@ def predict(si: SimpleInputs) -> Dict:
         min(abs(elo_diff)/50.0, 1.2),
         min(abs(net_diff)/6.0, 1.2),
         min(abs(form_diff)/6.0, 1.0),
-        min(abs(total_edge)/8.0, 1.0) * 0.4,
+        min(abs(total_edge)/8.0, 1.0) * 0.35,  # slightly less weight on totals now
     ]
     base_conf = clamp(48 + 34 * np.tanh(sum(base_components)), 50, 90)
 
-    # ---------- Side pick (market-aware) ----------
+    # ---------- Side pick (same disciplined logic as v3) ----------
     home_is_market_fav = si.market_spread_home_minus < 0
-    market_home_fav_by = -si.market_spread_home_minus   # +X => home -X,  -Y => away -Y
+    market_home_fav_by = -si.market_spread_home_minus
     home_fav_by = max(0.0, market_home_fav_by)
     away_fav_by = max(0.0, -market_home_fav_by)
-    model_home_spread = -exp_margin  # negative => our model favors home
+    model_home_spread = -exp_margin  # negative => model favors home
 
     # Start on market favorite ML
     side = f"{si.home_team} ML" if home_is_market_fav else f"{si.away_team} ML"
 
-    # Road favorite "don't fade" tiers (prefer Away ML unless we CLEARLY beat it)
+    # Road favorite "don't fade" tiers
     if away_fav_by >= ROAD_FAV_NOGO3 and home_wp < 0.62:
         side = f"{si.away_team} ML"
     elif away_fav_by >= ROAD_FAV_NOGO2 and home_wp < 0.60:
@@ -159,13 +195,13 @@ def predict(si: SimpleInputs) -> Dict:
     elif away_fav_by >= ROAD_FAV_NOGO1 and home_wp < 0.58:
         side = f"{si.away_team} ML"
 
-    # If we align with market favorite and beat the line by LAY_BUFFER with enough confidence → lay book line
+    # Lay book line only with real edge + confidence
     if home_is_market_fav and (exp_margin >= home_fav_by + LAY_BUFFER) and base_conf >= MIN_CONF_LAY:
         side = f"{si.home_team} -{home_fav_by:.1f}"
     elif (not home_is_market_fav) and ((-exp_margin) >= away_fav_by + LAY_BUFFER) and base_conf >= MIN_CONF_LAY:
         side = f"{si.away_team} -{away_fav_by:.1f}"
 
-    # Strong disagreement → prefer dog +spread if stronger than book by DOG_CONFLICT_BUFFER
+    # Strong disagreement → prefer dog +spread
     disagree = (home_is_market_fav and model_home_spread > 0) or ((not home_is_market_fav) and model_home_spread < 0)
     if disagree and base_conf >= (MIN_CONF_LAY - 2):
         book_line = home_fav_by if home_is_market_fav else away_fav_by
@@ -173,17 +209,17 @@ def predict(si: SimpleInputs) -> Dict:
             side = (f"{si.away_team} +{home_fav_by:.1f}" if home_is_market_fav
                     else f"{si.home_team} +{away_fav_by:.1f}")
 
-    # Tight 47–53 → give market dog +1.5 if we’re still on ML
+    # Tight 47–53 → market dog +1.5 if still ML
     if 0.47 <= home_wp <= 0.53 and ('+' not in side and '-' not in side):
         side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
 
-    # Confidence shaping (harder penalty when fading the market favorite)
+    # Confidence shaping
     pick_is_home = side.startswith(si.home_team)
     fading_market_fav = (home_is_market_fav and not pick_is_home) or ((not home_is_market_fav) and pick_is_home)
     conf = base_conf - (6.0 if fading_market_fav else 0.0) + (2.0 if ('-' in side) else 0.0)
     final_conf = clamp(conf, 50, 90)
 
-    # ---------- Totals (hybrid + L5 nudge) ----------
+    # ---------- Totals pick (strict) ----------
     if (pred_total - si.market_total) >= TOTAL_EDGE_FIRE:
         total_pick = f"Over {si.market_total:.1f}"
     elif (pred_total - si.market_total) <= -TOTAL_EDGE_FIRE:
@@ -204,16 +240,16 @@ def predict(si: SimpleInputs) -> Dict:
         "meta": {
             "lam": round(lam, 2),
             "k": round(k, 3),
+            "alpha_total": round(alpha, 3),
             "home_is_market_fav": home_is_market_fav,
             "home_fav_by": home_fav_by,
             "away_fav_by": away_fav_by,
             "model_home_spread": round(model_home_spread, 2),
             "conf_base": round(base_conf, 1),
-            "pred_total_model": round(model_total, 1),
-            "pred_total_market": round(si.market_total, 1),
             "total_edge": round(pred_total - si.market_total, 1),
             "bias_home_L5TT": round(bias_home, 1),
             "bias_away_L5TT": round(bias_away, 1),
+            "pace_est": round(pace_est, 1),
         }
     }
 
@@ -252,7 +288,6 @@ with st.form("simple_game"):
     submitted = st.form_submit_button("Predict Game")
 
 if submitted:
-    # Convert 0.0 to None for L5 team totals (treat 0 as "not provided")
     home_l5_tt_opt = None if home_l5_tt == 0.0 else home_l5_tt
     away_l5_tt_opt = None if away_l5_tt == 0.0 else away_l5_tt
 
@@ -298,7 +333,6 @@ if st.session_state.slate:
     ])
     st.dataframe(df, use_container_width=True)
 
-    # High-confidence plays only (tighten filters)
     ranked = sorted(
         [g for g in st.session_state.slate if g['output']['confidence_pct'] >= 70],
         key=lambda x: x['output']['confidence_pct'], reverse=True
@@ -311,7 +345,6 @@ if st.session_state.slate:
     else:
         st.info("No plays ≥ 70% confidence.")
 
-    # 🔒 Lock: ≥75% and cannot fade a road favorite of 2.5+ (use ROAD_FAV_NOGO2 here)
     lock_candidates = []
     for g in ranked:
         meta = g['output'].get('meta', {})
