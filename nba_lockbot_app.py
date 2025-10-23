@@ -7,21 +7,21 @@ import pandas as pd
 import streamlit as st
 
 """
-NBA Prediction — **Accuracy-Tuned v2 (Like Our NFL)**
+NBA Prediction — Accuracy-Tuned v2 (Like Our NFL)
 
 Goals: tighter, safer, and more market-aware while keeping inputs minimal.
 
-Key logic (what changed vs prior):
-- **Heavier market anchoring** for win% (λ=0.65) and **hybrid total** (80% book / 20% model).
-- **Safer spread usage**: only lay the **book line** when our model beats it by ≥ **+2.5 pts** AND base confidence ≥ **72%**.
-- **Road-favorite & dog rules**: don’t fade road favorites lightly; when disagreeing with market, prefer **dog +spread** over ML and require strong edge.
-- **Confidence shaping**: small penalty for fading market favorite; small boost when we agree and beat the number.
-- **Optional Advanced tweaks** (collapsed): Off/Def Missing per 100 for each team (default 0), used to adjust nets internally.
-- **Debug meta** shows market vs model spread and edges for quick tuning.
+Key logic:
+- Heavier market anchoring for win% (λ=0.65) and hybrid total (80% book / 20% model).
+- Safer spread usage: only lay the book line when our model beats it by ≥ +2.5 pts AND base confidence ≥ 72%.
+- Road-favorite & dog rules: don’t fade road favorites lightly; when disagreeing with market, prefer dog +spread over ML and require strong edge.
+- Confidence shaping: penalty for fading market favorite; small boost when we agree and beat the number.
+- Optional Advanced tweaks: Off/Def Missing per 100 (default 0), used to adjust nets internally.
+- Debug meta shows market vs model spread and edges for tuning.
 """
 
 st.set_page_config(page_title="NBA Predictor — Tuned v2", layout="wide")
-st.title("🏀 NBA Prediction — Accuracy‑Tuned v2 (Like Our NFL)")
+st.title("🏀 NBA Prediction — Accuracy-Tuned v2 (Like Our NFL)")
 st.caption("Minimal inputs. Market-aware edges, disciplined spread usage, safer totals, optional advanced tweaks.")
 
 # ---------------------------
@@ -138,7 +138,7 @@ def predict(si: SimpleInputs) -> Dict:
     elif (not home_is_market_fav) and ((-exp_margin) >= away_fav_by + 2.5) and base_conf >= 72:
         side = f"{si.away_team} -{away_fav_by:.1f}"
 
-    # If we disagree with market by a strong amount (|model spread| >= book + 1.5), take the **dog +spread** (safer)
+    # If we disagree with market by a strong amount (|model spread| >= book + 1.5), take the dog +spread
     disagree = (home_is_market_fav and model_home_spread > 0) or ((not home_is_market_fav) and model_home_spread < 0)
     if disagree and base_conf >= 70:
         book_line = home_fav_by if home_is_market_fav else away_fav_by
