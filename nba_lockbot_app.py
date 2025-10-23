@@ -58,7 +58,7 @@ def predict(si: SimpleInputs) -> Dict:
     form_diff = si.home_l5 - si.away_l5
 
     # Linear score → win prob (compact model)
-    w_hca = 0.6          # reduced home-court
+    w_hca = 0.5  # further reduced home-court          # reduced home-court
     w_elo = 0.008        # per elo point
     w_net = 0.075        # per net rating point
     w_form = 0.06        # per margin point
@@ -71,7 +71,7 @@ def predict(si: SimpleInputs) -> Dict:
     market_prior = logistic(-k * si.market_spread_home_minus)
 
     # Blend model with market prior (lam = weight on market)
-    lam = 0.45
+    lam = 0.60
     home_wp = (1 - lam) * home_wp_model + lam * market_prior
     away_wp = 1 - home_wp
 
@@ -82,8 +82,11 @@ def predict(si: SimpleInputs) -> Dict:
     # Predicted total using pace_est and net/form
     net_nudge = 0.35 * (si.home_net + si.away_net)
     form_nudge = 0.25 * (si.home_l5 + si.away_l5)
-    total_per100 = (LEAGUE_ORtg*2) + net_nudge + form_nudge  # per 100 poss
-    pred_total = clamp(pace_est * total_per100 / 100.0, 180, 270)
+    model_total_per100 = (LEAGUE_ORtg*2) + net_nudge + form_nudge  # per 100 poss
+    model_total = clamp(pace_est * model_total_per100 / 100.0, 180, 270)
+
+    # Hybrid to respect the book: 70% market, 30% model
+    pred_total = 0.70 * si.market_total + 0.30 * model_total
 
     # Expected margin
     exp_margin = (home_wp - 0.5) * 20 + 0.4 * net_diff + 0.25 * form_diff
@@ -106,7 +109,7 @@ def predict(si: SimpleInputs) -> Dict:
     base_conf = clamp(48 + 34*np.tanh(sum(base_components)), 50, 90)
 
     # ---------------------------
-    # Side pick — market-aware discipline
+    # Side pick — stronger market anchoring
     # ---------------------------
     favor_home = home_wp >= 0.5
     home_is_market_fav = si.market_spread_home_minus < 0
@@ -114,38 +117,62 @@ def predict(si: SimpleInputs) -> Dict:
     home_fav_by = max(0.0, market_home_fav_by)
     away_fav_by = max(0.0, -market_home_fav_by)
 
-    # Default ML on our favored side
-    side = f"{si.home_team} ML" if favor_home else f"{si.away_team} ML"
+    # Default side follows the market favorite unless our model shows a clear >2.0 pt edge the other way
+    market_fav_team = 'home' if home_is_market_fav else 'away'
 
-    # Road favorite guardrail: if away is -2.5 or more and our home win% < 58%, avoid fading
+    # Model-implied spread for home (positive = we think home should be favored)
+    model_spread_home = -exp_margin  # if home expected_margin>0, home should win; convert to away-home sign
+
+    # If model conflicts with market but by less than (market line + 1), stick with market
+    conflict_with_market = (home_is_market_fav and model_spread_home > 0) or ((not home_is_market_fav) and model_spread_home < 0)
+    strong_conflict = False
+    if conflict_with_market:
+        needed = (home_fav_by if home_is_market_fav else away_fav_by) + 1.0
+        strong_conflict = abs(model_spread_home) >= needed
+
+    # Start with market favorite ML
+    if market_fav_team == 'home':
+        side = f"{si.home_team} ML"
+    else:
+        side = f"{si.away_team} ML"
+
+    # If we align with the market favorite and beat the number by +2 and conf ≥ 70, lay the market line
+    if home_is_market_fav and (exp_margin >= home_fav_by + 2) and base_conf >= 70:
+        side = f"{si.home_team} -{home_fav_by:.1f}"
+    elif (not home_is_market_fav) and ((-exp_margin) >= away_fav_by + 2) and base_conf >= 70:
+        side = f"{si.away_team} -{away_fav_by:.1f}"
+
+    # If we strongly disagree with market, choose the dog +spread instead of ML (safer), require strong_conflict
+    if strong_conflict and base_conf >= 68:
+        if home_is_market_fav:
+            # Market says home -, we like away -> take Away +line
+            side = f"{si.away_team} +{home_fav_by:.1f}"
+        else:
+            side = f"{si.home_team} +{away_fav_by:.1f}"
+
+    # Road favorite guardrail: if away is -2.5+ and our home win% < 58%, avoid fading
     if away_fav_by >= 2.5 and home_wp < 0.58:
-        # Only lay if we beat the number by +2 and have ≥68% confidence
-        if (-exp_margin) >= away_fav_by + 2 and base_conf >= 68:
+        if ((-exp_margin) >= away_fav_by + 2) and base_conf >= 70:
             side = f"{si.away_team} -{away_fav_by:.1f}"
         else:
             side = f"{si.away_team} ML"
-    else:
-        # If we align with the market favorite, lay the **market line** only when we beat it by +2 and conf ≥ 68
-        if favor_home and home_is_market_fav and (exp_margin >= home_fav_by + 2) and base_conf >= 68:
-            side = f"{si.home_team} -{home_fav_by:.1f}"
-        elif (not favor_home) and (not home_is_market_fav) and ((-exp_margin) >= away_fav_by + 2) and base_conf >= 68:
-            side = f"{si.away_team} -{away_fav_by:.1f}"
-        # Tight game safety 47–53: give market underdog +1.5
-        elif 0.47 <= home_wp <= 0.53:
-            side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
-        # Otherwise keep ML default
 
-    # Confidence penalty: if our side pick goes against the market favorite, trim confidence
+    # Tight-game safety 47–53: give market underdog +1.5 (only if not already using market +spread)
+    if 0.47 <= home_wp <= 0.53 and ('+' not in side and '-' not in side):
+        side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
+
+    # Confidence penalty if fading market favorite
     pick_is_home = side.startswith(si.home_team)
     we_fade_market_fav = (home_is_market_fav and not pick_is_home) or ((not home_is_market_fav) and pick_is_home)
-    conf_penalty = 4.0 if we_fade_market_fav else 0.0
+    conf_penalty = 5.0 if we_fade_market_fav else 0.0
 
     # ---------------------------
-    # Total pick — stricter
+    # Total pick — stricter (using hybrid total)
     # ---------------------------
-    if total_edge >= 5.0:
+    # ---------------------------
+    if (pred_total - si.market_total) >= 5.0:
         total_pick = f"Over {si.market_total:.1f}"
-    elif total_edge <= -5.0:
+    elif (pred_total - si.market_total) <= -5.0:
         total_pick = f"Under {si.market_total:.1f}"
     else:
         total_pick = "Pass total"
@@ -168,7 +195,7 @@ def predict(si: SimpleInputs) -> Dict:
             "away_fav_by": away_fav_by,
             "conf_base": round(base_conf, 1),
             "conf_penalty": conf_penalty,
-            "total_edge": round(total_edge, 1),
+            "total_edge": round(pred_total - si.market_total, 1),
         }
     }
 
