@@ -6,40 +6,38 @@ import pandas as pd
 import streamlit as st
 
 """
-NBA Predictor — NFL-Style Minimal (v1)
-Philosophy (same as our NFL build):
-- Use the MARKET as source of truth.
-- Add a tiny nudge from Power/Form to the spread/total (tight caps).
-- Convert blended spread -> win% with a CALIBRATED curve (NBA: -5.5 ≈ ~70% ML).
-- Split points directly from (total, spread). That's it.
-
-Inputs: Home/away team, power ratings, market spread (home = negative), market total, last-5 form (optional).
+NBA Predictor — NFL-Style Minimal (v1.1)
+- Market-led: spread & total are the truth; we add tiny power/form nudges.
+- Convert blended spread -> win% with calibrated curve (NBA: -5.5 ≈ ~70% ML).
+- Split team scores directly from (total, spread). No pace, no extras.
+- FIXED: underdog +spread logic (will now give the dog +book when our number
+  is ≥ EDGE_TO_LAY points toward the dog).
 """
 
 # =================== Tunables (keep tiny) ===================
 SHOW_DEBUG = False
 
 # Calibrated spread -> win% (NBA)
-K_SPREAD = 0.15            # => -5.5 ~70% ML
-PROB_SQUASH_TEMP = 0.90    # compress probabilities toward 0.5
+K_SPREAD = 0.15             # => -5.5 ~70% ML
+PROB_SQUASH_TEMP = 0.90     # compress probabilities toward 0.5
 
 # Market anchoring
-WMKT_SPREAD = 0.85         # 85% market, 15% model for spread
-WMKT_TOTAL  = 0.90         # 90% market, 10% model for total
+WMKT_SPREAD = 0.85          # 85% market, 15% model for spread
+WMKT_TOTAL  = 0.90          # 90% market, 10% model for total
 
-# Tiny model components
-HFA_PTS = 1.8              # home court baseline (pts)
-BETA_POWER = 0.06          # (home_power - away_power) / 50 * BETA_POWER*50 => ~3 pts at 50 diff
-BETA_FORM  = 0.04          # (homeL5 - awayL5)
+# Tiny model components (small, stable)
+HFA_PTS = 1.8               # baseline home-court (pts)
+BETA_POWER = 0.06           # pts per (home_power - away_power)
+BETA_FORM  = 0.04           # pts per (homeL5 - awayL5)
 
 # Caps (keep model in its lane)
-SPREAD_NUDGE_CAP = 1.5     # our model can shift market spread by at most ±1.5
-TOTAL_NUDGE_CAP  = 2.0     # our model can shift market total by at most ±2.0
-FINAL_TOTAL_CLAMP = 4.0    # final total stays within ±4 of market
+SPREAD_NUDGE_CAP = 1.5      # our model can move spread by at most ±1.5 vs book
+TOTAL_NUDGE_CAP  = 2.0      # our model can move total by at most ±2.0 vs book
+FINAL_TOTAL_CLAMP = 4.0     # final total stays within ±4 of market
 
 # Recommendation thresholds
-EDGE_TO_LAY  = 2.5         # need to beat book spread by ≥2.5 to lay the number
-CONF_BASEMAX = 78.0        # cap base confidence
+EDGE_TO_LAY  = 2.5          # need to beat book spread by ≥2.5 to lay the number
+CONF_BASEMAX = 78.0         # cap base confidence
 
 st.set_page_config(page_title="NBA — NFL-Style Minimal", layout="wide")
 st.title("🏀 NBA Predictor — NFL-Style Minimal")
@@ -56,26 +54,28 @@ def clamp(x: float, lo: float, hi: float) -> float:
 class Inputs:
     home_team: str
     away_team: str
-    home_power: float    # ELO/power, NFL-style
+    home_power: float    # ELO/power, any scale (relative diffs matter)
     away_power: float
-    market_spread_home_minus: float  # home favored = negative
+    market_spread_home_minus: float  # home favored = negative (e.g., -5.5)
     market_total: float
-    home_l5: float = 0.0
+    home_l5: float = 0.0             # optional recent form (avg margin)
     away_l5: float = 0.0
 
 def predict(si: Inputs) -> Dict:
-    # -------- Model spread (home perspective; negative => home favored) --------
+    # -------- Model margin (home perspective; + = home by X) --------
     power_diff = si.home_power - si.away_power
     form_diff  = si.home_l5 - si.away_l5
 
-    # model margin for home (positive => home by X)
-    model_margin = HFA_PTS + (BETA_POWER * (power_diff / 1.0)) + (BETA_FORM * form_diff)
-    model_margin = clamp(model_margin, -8, 8)  # safety
+    model_margin = HFA_PTS + (BETA_POWER * power_diff) + (BETA_FORM * form_diff)
+    model_margin = clamp(model_margin, -8, 8)  # safety cap
 
-    model_home_spread = -model_margin  # convert to "home spread sign"
-    # nudge relative to market
-    spread_nudge = clamp(model_home_spread - si.market_spread_home_minus,
-                         -SPREAD_NUDGE_CAP, SPREAD_NUDGE_CAP)
+    # Convert to home-spread sign convention (negative = home favored)
+    model_home_spread = -model_margin
+
+    # -------- Blend with market (spread) --------
+    # Amount we would move the book line (clamped small)
+    raw_spread_nudge = model_home_spread - si.market_spread_home_minus
+    spread_nudge = clamp(raw_spread_nudge, -SPREAD_NUDGE_CAP, SPREAD_NUDGE_CAP)
     blended_home_spread = si.market_spread_home_minus + (1.0 - WMKT_SPREAD) * spread_nudge
 
     # -------- Win probability from blended spread --------
@@ -83,8 +83,7 @@ def predict(si: Inputs) -> Dict:
     home_wp = 0.5 + (market_prior - 0.5) * PROB_SQUASH_TEMP
     away_wp = 1 - home_wp
 
-    # -------- Total: tiny model nudge --------
-    # use power/form to make a very small move away from market
+    # -------- Total: tiny model nudge, tightly clamped --------
     total_nudge = clamp(0.03 * abs(power_diff) + 0.05 * (si.home_l5 + si.away_l5),
                         -TOTAL_NUDGE_CAP, TOTAL_NUDGE_CAP)
     blended_total = si.market_total + (1.0 - WMKT_TOTAL) * total_nudge
@@ -93,35 +92,42 @@ def predict(si: Inputs) -> Dict:
                           si.market_total + FINAL_TOTAL_CLAMP)
 
     # -------- Split score from (total, spread) --------
-    # Relationship: home_pts - away_pts = -home_spread  (since home_spread < 0 when home favored)
+    # home_pts - away_pts = -blended_home_spread
     home_pts = blended_total / 2 - blended_home_spread / 2
     away_pts = blended_total - home_pts
 
-    # soft caps (NBA realism)
+    # Soft caps for realism
     home_pts = clamp(home_pts, 80, 135)
     away_pts = clamp(away_pts, 80, 135)
-    # re-balance if clamped
     tot_after = home_pts + away_pts
     if abs(tot_after - blended_total) > 0.01:
         scale = blended_total / tot_after
         home_pts = clamp(home_pts * scale, 80, 135)
         away_pts = clamp(away_pts * scale, 80, 135)
 
-    # -------- Side recommendation (NFL-style) --------
-    # If our blended spread favors the market favorite by >= EDGE_TO_LAY, lay the book line; else ML.
+    # -------- Side recommendation (NFL-style, FIXED dog logic) --------
     home_is_fav = si.market_spread_home_minus < 0
-    home_edge_vs_book = (-(blended_home_spread)) - (-(si.market_spread_home_minus))  # compare margins
-    # (equivalently: edge = market_spread_home_minus - blended_home_spread, but flip signs carefully)
+    fav_team = si.home_team if home_is_fav else si.away_team
+    dog_team = si.away_team if home_is_fav else si.home_team
+    book_line = si.market_spread_home_minus  # home-spread sign
 
-    side = f"{si.home_team} ML" if home_is_fav else f"{si.away_team} ML"
-    if home_is_fav and (home_edge_vs_book >= EDGE_TO_LAY):
-        side = f"{si.home_team} {si.market_spread_home_minus:.1f}"
-    elif (not home_is_fav):
-        away_edge_vs_book = ((blended_home_spread) - (si.market_spread_home_minus))
-        if away_edge_vs_book <= -EDGE_TO_LAY:  # blended favors away by at least 2.5 more than book
-            side = f"{si.away_team} +{abs(si.market_spread_home_minus):.1f}" if si.market_spread_home_minus > 0 else f"{si.away_team} {si.market_spread_home_minus:.1f}"
+    # Edges relative to book, measured in points toward fav or dog
+    # If blended number is less pro-home than book, that's "toward dog".
+    edge_toward_dog = blended_home_spread - book_line
+    edge_toward_fav = -edge_toward_dog
 
-    # Totals: only fire if we actually moved meaningfully (≥3.5)
+    # Default: ML on favorite
+    side = f"{fav_team} ML"
+
+    # Lay the book line only if we beat it toward the favorite by EDGE_TO_LAY+
+    if edge_toward_fav >= EDGE_TO_LAY:
+        side = f"{fav_team} {book_line:.1f}"
+
+    # Otherwise, if we beat it toward the dog by EDGE_TO_LAY+, take dog +spread
+    elif edge_toward_dog >= EDGE_TO_LAY:
+        side = f"{dog_team} +{abs(book_line):.1f}"
+
+    # -------- Totals recommendation --------
     total_edge = blended_total - si.market_total
     if total_edge >= 3.5:
         total_pick = f"Over {si.market_total:.1f}"
@@ -130,10 +136,10 @@ def predict(si: Inputs) -> Dict:
     else:
         total_pick = "Pass total"
 
-    # -------- Confidence (simple, NFL-style) --------
-    # base from |spread|; small boost if we beat the book by a lot; cap modestly
+    # -------- Confidence (simple, modest) --------
     base_conf = 52 + 5.0 * np.tanh(abs(blended_home_spread) / 6.0) * 100/100
-    beat_book = max(0.0, abs(spread_nudge) - 0.5) / (SPREAD_NUDGE_CAP)  # how much we pushed against book
+    # extra confidence if we pushed hard against the book (beyond 0.5 of our cap)
+    beat_book = max(0.0, abs(spread_nudge) - 0.5) / (SPREAD_NUDGE_CAP)
     base_conf += 8.0 * beat_book
     base_conf = clamp(base_conf, 55, CONF_BASEMAX)
 
@@ -154,6 +160,8 @@ def predict(si: Inputs) -> Dict:
             "total_nudge": round(total_nudge, 2),
             "market_spread": si.market_spread_home_minus,
             "market_total": si.market_total,
+            "edge_toward_dog": round(edge_toward_dog, 2),
+            "edge_toward_fav": round(edge_toward_fav, 2),
         }
     }
 
@@ -166,8 +174,8 @@ with st.form("game"):
     with c1:
         home_team = st.text_input("Home Team", "Hawks")
         away_team = st.text_input("Away Team", "Raptors")
-        home_power = st.number_input("Home Power", 1300.0, 1900.0, 1600.0, 1.0)
-        away_power = st.number_input("Away Power", 1300.0, 1900.0, 1585.0, 1.0)
+        home_power = st.number_input("Home Power", 1200.0, 1900.0, 1600.0, 1.0)
+        away_power = st.number_input("Away Power", 1200.0, 1900.0, 1585.0, 1.0)
     with c2:
         market_spread_home_minus = st.number_input("Market Spread (home negative)", -20.0, 20.0, -5.5, 0.5)
         market_total = st.number_input("Market Total", 170.0, 280.0, 230.5, 0.5)
