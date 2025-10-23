@@ -1,39 +1,34 @@
 import math
 from dataclasses import dataclass, asdict
-from typing import Dict
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 """
-NBA Prediction — **Simplest Version (like our NFL)**
-Now with **no Game Pace input**. We auto-estimate pace from team Net Ratings and last-5 form so you only enter a few fields.
+NBA Prediction — **Accuracy-Tuned Simple Model (Like Our NFL)**
 
-Inputs per game:
-- Teams
-- Home Net Rating, Away Net Rating (Net = ORtg − DRtg)
-- Home L5 Avg Margin, Away L5 Avg Margin
-- Home Power/ELO, Away Power/ELO
-- Market Spread (home negative if favored), Market Total
-
-Outputs:
-- Home/Away win %
-- Predicted score & total (pace auto-estimated)
-- Side pick (ML / ±1.5 with safer logic)
-- Total pick (Over/Under/Pass)
-- Confidence %
-- Slate builder with Top 3 & 🔒 Lock of the Day
+Upgrades applied:
+- Market prior blend 45% (respects sharp spreads)
+- Lower home-court weight (road favorites won’t get drowned)
+- Road-favorite guardrail (don’t fade away -2.5+ lightly)
+- Only lay full market line when our edge clearly beats the book (+2 pts) AND confidence ≥ 68%
+- Totals recommended only with ≥ 5.0-pt edge
+- Auto pace (no input), clamped tighter (96–102)
+- Confidence penalty for fading market favorite
+- Top 3 require ≥ 68% confidence; 🔒 Lock requires ≥ 72% and cannot fade a road favorite
 """
 
-st.set_page_config(page_title="NBA Predictor — Simplest", layout="wide")
-st.title("🏀 NBA Prediction — Simplest (Like Our NFL)")
-st.caption("No pace input required. Minimal fields → predictions, Top 3, and one 🔒 Lock of the Day.")
+st.set_page_config(page_title="NBA Predictor — Tuned", layout="wide")
+st.title("🏀 NBA Prediction — Accuracy-Tuned (Like Our NFL)")
+st.caption("Minimal inputs. Market-aware edges, safer spread usage, better totals filter, and stricter Lock rules.")
 
 # ---------------------------
 # Helpers
 # ---------------------------
 LEAGUE_ORtg = 112.0  # baseline per 100
+
 
 def logistic(x: float) -> float:
     return 1 / (1 + math.exp(-x))
@@ -41,6 +36,7 @@ def logistic(x: float) -> float:
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
 
 @dataclass
 class SimpleInputs:
@@ -62,7 +58,7 @@ def predict(si: SimpleInputs) -> Dict:
     form_diff = si.home_l5 - si.away_l5
 
     # Linear score → win prob (compact model)
-    w_hca = 0.8  # reduced home-court weight so road favorites don't get drowned out          # home court
+    w_hca = 0.6          # reduced home-court
     w_elo = 0.008        # per elo point
     w_net = 0.075        # per net rating point
     w_form = 0.06        # per margin point
@@ -71,19 +67,17 @@ def predict(si: SimpleInputs) -> Dict:
     home_wp_model = logistic(linear)
 
     # --- Market-aware prior from spread (home negative => favored)
-    # Map spread points to win prob via logistic slope k
-    k = 0.23  # per point; tweakable
+    k = 0.23  # mapping spread→prob slope
     market_prior = logistic(-k * si.market_spread_home_minus)
 
-    # Blend model with market prior (lambda = weight on market)
-    lam = 0.30  # 30% market pull to avoid fighting sharp lines in simplified model
+    # Blend model with market prior (lam = weight on market)
+    lam = 0.45
     home_wp = (1 - lam) * home_wp_model + lam * market_prior
     away_wp = 1 - home_wp
 
     # --- Auto-estimated pace (no input) ---
-    # Start at league typical ~99.5 and nudge by style (net) + recent tempo proxy (L5 margins)
-    pace_est = 99.5 + 0.25 * (si.home_net + si.away_net) + 0.12 * (si.home_l5 + si.away_l5)
-    pace_est = clamp(pace_est, 94.0, 104.0)
+    pace_est = 99.5 + 0.20 * (si.home_net + si.away_net) + 0.10 * (si.home_l5 + si.away_l5)
+    pace_est = clamp(pace_est, 96.0, 102.0)
 
     # Predicted total using pace_est and net/form
     net_nudge = 0.35 * (si.home_net + si.away_net)
@@ -99,52 +93,64 @@ def predict(si: SimpleInputs) -> Dict:
     home_pts = clamp(pred_total * share + 0.4*exp_margin, 70, 160)
     away_pts = clamp(pred_total - home_pts, 70, 160)
 
-    # Picks — market-aware logic: use the **market line** when we have a solid edge
-    favor_home = home_wp >= 0.5
+    # ---------------------------
+    # Confidence (base)
+    # ---------------------------
+    total_edge = pred_total - si.market_total
+    base_components = [
+        min(abs(elo_diff)/50.0, 1.2),
+        min(abs(net_diff)/6.0, 1.2),
+        min(abs(form_diff)/6.0, 1.0),
+        min(abs(total_edge)/8.0, 1.0) * 0.5,
+    ]
+    base_conf = clamp(48 + 34*np.tanh(sum(base_components)), 50, 90)
 
-    # Market view (home negative => favored)
+    # ---------------------------
+    # Side pick — market-aware discipline
+    # ---------------------------
+    favor_home = home_wp >= 0.5
     home_is_market_fav = si.market_spread_home_minus < 0
     market_home_fav_by = -si.market_spread_home_minus      # +X => home -X,  -Y => away -Y
     home_fav_by = max(0.0, market_home_fav_by)
     away_fav_by = max(0.0, -market_home_fav_by)
 
-    # Default side from model (moneyline safety)
+    # Default ML on our favored side
     side = f"{si.home_team} ML" if favor_home else f"{si.away_team} ML"
 
-    # If we favor the same team the market favors and our expected margin clears the book by a buffer,
-    # bet **the market line** (not auto -1.5).
-    buffer_pts = 1.0  # require we beat the book by at least 1 pt
-
-    if favor_home and home_is_market_fav:
-        if exp_margin >= home_fav_by + buffer_pts:
-            side = f"{si.home_team} -{home_fav_by:.1f}"
-    elif (not favor_home) and (not home_is_market_fav):
-        if (-exp_margin) >= away_fav_by + buffer_pts:
+    # Road favorite guardrail: if away is -2.5 or more and our home win% < 58%, avoid fading
+    if away_fav_by >= 2.5 and home_wp < 0.58:
+        # Only lay if we beat the number by +2 and have ≥68% confidence
+        if (-exp_margin) >= away_fav_by + 2 and base_conf >= 68:
             side = f"{si.away_team} -{away_fav_by:.1f}"
+        else:
+            side = f"{si.away_team} ML"
+    else:
+        # If we align with the market favorite, lay the **market line** only when we beat it by +2 and conf ≥ 68
+        if favor_home and home_is_market_fav and (exp_margin >= home_fav_by + 2) and base_conf >= 68:
+            side = f"{si.home_team} -{home_fav_by:.1f}"
+        elif (not favor_home) and (not home_is_market_fav) and ((-exp_margin) >= away_fav_by + 2) and base_conf >= 68:
+            side = f"{si.away_team} -{away_fav_by:.1f}"
+        # Tight game safety 47–53: give market underdog +1.5
+        elif 0.47 <= home_wp <= 0.53:
+            side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
+        # Otherwise keep ML default
 
-    # Guardrail: If away is market favorite by >= 2 and our home win% < 60%, don't fade — lean away ML
-    if away_fav_by >= 2.0 and home_wp < 0.60:
-        side = f"{si.away_team} ML" if not ((-exp_margin) >= away_fav_by + buffer_pts) else f"{si.away_team} -{away_fav_by:.1f}"
+    # Confidence penalty: if our side pick goes against the market favorite, trim confidence
+    pick_is_home = side.startswith(si.home_team)
+    we_fade_market_fav = (home_is_market_fav and not pick_is_home) or ((not home_is_market_fav) and pick_is_home)
+    conf_penalty = 4.0 if we_fade_market_fav else 0.0
 
-    # Tight-game safety: near coin flip (47–53) — give market underdog +1.5
-    if 0.47 <= home_wp <= 0.53:
-        side = f"{si.home_team} +1.5" if not home_is_market_fav else f"{si.away_team} +1.5"
-
-    total_edge = pred_total - si.market_total
-    if total_edge >= 3.0:
+    # ---------------------------
+    # Total pick — stricter
+    # ---------------------------
+    if total_edge >= 5.0:
         total_pick = f"Over {si.market_total:.1f}"
-    elif total_edge <= -3.0:
+    elif total_edge <= -5.0:
         total_pick = f"Under {si.market_total:.1f}"
     else:
         total_pick = "Pass total"
 
-    comp = [
-        min(abs(elo_diff)/50.0, 1.2),
-        min(abs(net_diff)/6.0, 1.2),
-        min(abs(form_diff)/6.0, 1.0),
-        min(abs(total_edge)/8.0, 1.0)*0.6,
-    ]
-    conf = clamp(48 + 34*np.tanh(sum(comp)), 50, 86)
+    final_conf = clamp(base_conf - conf_penalty, 50, 90)
 
     return {
         "home_win_prob": round(100*home_wp, 1),
@@ -155,14 +161,22 @@ def predict(si: SimpleInputs) -> Dict:
         "expected_margin": round(exp_margin, 2),
         "side_play": side,
         "total_play": total_pick,
-        "confidence_pct": round(conf, 1),
+        "confidence_pct": round(final_conf, 1),
+        "meta": {
+            "home_is_market_fav": home_is_market_fav,
+            "home_fav_by": home_fav_by,
+            "away_fav_by": away_fav_by,
+            "conf_base": round(base_conf, 1),
+            "conf_penalty": conf_penalty,
+            "total_edge": round(total_edge, 1),
+        }
     }
 
 # ---------------------------
 # UI
 # ---------------------------
 if 'slate' not in st.session_state:
-    st.session_state.slate = []
+    st.session_state.slate: List[Dict] = []
 
 with st.form("simple_game"):
     c1, c2 = st.columns(2)
@@ -197,6 +211,8 @@ if submitted:
 
     st.write(f"**Predicted Score:** {away_team} {out['pred_away']} @ {home_team} {out['pred_home']}")
     st.write(f"**Side:** {out['side_play']}  |  **Total:** {out['total_play']}  |  **Edge (spread est):** {out['expected_margin']} pts")
+    with st.expander("Debug meta (for tuning)"):
+        st.json(out["meta"])
 
     if st.button("➕ Add to Slate"):
         st.session_state.slate.append({
@@ -221,16 +237,36 @@ if st.session_state.slate:
     ])
     st.dataframe(df, use_container_width=True)
 
-    ranked = sorted(st.session_state.slate, key=lambda x: x['output']['confidence_pct'], reverse=True)
-    st.markdown("### ⭐ Top 3 Plays")
-    for i, g in enumerate(ranked[:3], 1):
-        st.write(f"**{i}.** {g['inputs']['away_team']} @ {g['inputs']['home_team']} — {g['output']['side_play']} | {g['output']['total_play']} ({g['output']['confidence_pct']}% conf)")
+    # Filter for Top 3: only high-confidence picks
+    ranked = sorted(
+        [g for g in st.session_state.slate if g['output']['confidence_pct'] >= 68],
+        key=lambda x: x['output']['confidence_pct'], reverse=True
+    )
 
-    lock = ranked[0] if ranked else None
-    if lock:
-        g = lock
+    st.markdown("### ⭐ Top Plays (Conf ≥ 68%)")
+    if ranked:
+        for i, g in enumerate(ranked[:3], 1):
+            st.write(f"**{i}.** {g['inputs']['away_team']} @ {g['inputs']['home_team']} — {g['output']['side_play']} | {g['output']['total_play']} ({g['output']['confidence_pct']}% conf)")
+    else:
+        st.info("No plays ≥ 68% confidence.")
+
+    # 🔒 Lock: must be ≥72% and cannot fade a road favorite
+    lock_candidates = []
+    for g in ranked:
+        meta = g['output'].get('meta', {})
+        home_is_fav = meta.get('home_is_market_fav', False)
+        away_fav_by = meta.get('away_fav_by', 0.0)
+        pick = g['output']['side_play']
+        pick_is_home = pick.startswith(g['inputs']['home_team'])
+        fades_road_fav = (away_fav_by >= 2.5) and pick_is_home
+        if (g['output']['confidence_pct'] >= 72) and (not fades_road_fav):
+            lock_candidates.append(g)
+    if lock_candidates:
+        g = lock_candidates[0]
         st.markdown("### 🔒 Lock of the Day")
         st.success(f"{g['inputs']['away_team']} @ {g['inputs']['home_team']} — {g['output']['side_play']} | {g['output']['total_play']}  ({g['output']['confidence_pct']}% confidence)")
+    else:
+        st.info("No safe Lock meeting the ≥72% & no-road-fade rules.")
 
     if st.button("🗑️ Clear Slate"):
         st.session_state.slate = []
@@ -239,11 +275,17 @@ else:
     st.info("Add a game result above to build the slate and get Top 3 + 🔒 Lock.")
 
 st.markdown("""
-**Notes**
-- **No pace input needed.** We estimate pace around 99.5 and nudge it using team Net Ratings and last-5 form, then clamp to a realistic range (94–104).
-- **Net Rating:** ORtg − DRtg. If you only have overall net, use that.
-- **L5 Avg Margin:** Avg point diff over last 5 games.
-- **Power/ELO:** Any power number you use (e.g., 1500–1800 scale). Higher = better.
-- **Market Spread:** Negative if home is favored (e.g., -4.5). Positive if home is an underdog.
-- **Market Total:** Sportsbook total for the game.
+**Inputs**
+- **Net Rating:** ORtg − DRtg (per 100). Overall net works if you don’t have home/away splits.
+- **L5 Avg Margin:** Avg point diff over last 5.
+- **Power/ELO:** Any 1500–1800-style number; higher = better.
+- **Market Spread:** Negative if home is favored (e.g., -4.5). Positive if home is a dog (e.g., +2.5 means away favored by 2.5).
+- **Market Total:** Book total.
+
+**How picks are chosen**
+- Moneyline by default on the side with higher win %.
+- Lay the **market line** only if we beat it by **≥ 2 pts** and **confidence ≥ 68%**.
+- Don’t fade road favorites of **≥ 2.5** unless our edge is big; otherwise lean Away ML.
+- Totals only when **edge ≥ 5.0**.
+- Confidence is trimmed when fading the market favorite.
 """)
